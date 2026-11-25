@@ -56,6 +56,18 @@ re fw 文件 [--base 0x08000000] [--vectors]
 Cortex-M 向量表：初始 SP、Reset、标准异常入口、IRQ 表、代码区范围。
 判断规则只有三条：SP 合理、Reset 带 Thumb 位、Reset 落在映像内。`--vectors` 列出全部非零向量。
 
+## re fwmap
+
+```
+re fwmap 文件 [-o 输出目录] [--base 0x08000000]
+```
+
+一次产出：`image.bin`、`full.asm`（逐字节线性反汇编）、`functions.json`（rizin 函数表）、
+`analysis.json`（每函数指令数、调用图、外设地址命中）、`function-map.md`（按大小排序的函数表）。
+
+外设地址的识别覆盖两种构造：字面量池 `ldr rX,[pc,#imm]` 和 `movw/movt` 拼地址，
+寄存器跟踪是线性近似（不区分分支路径），命中结果都带函数归属。
+
 ## re funcs
 
 ```

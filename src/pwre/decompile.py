@@ -49,6 +49,42 @@ def _prepare(path: Path, base: int | None):
     return path, [], False
 
 
+def decompile_all(path: Path, out_file: Path, base: int | None = None,
+                  timeout: int = 900) -> str:
+    """一次性把目标里所有函数反编译到 out_file（导入+分析只做一遍）。"""
+    exe = engines.require("ghidra")
+    java = engines.require("java")
+    env = dict(os.environ)
+    env["JAVA_HOME"] = str(Path(java).parent.parent)
+    project_root = Path(tempfile.mkdtemp(prefix="re-proj-", dir=str(engines.data_dir())))
+    temp_input = None
+    try:
+        target, loader, needs_cleanup = _prepare(path, base)
+        if needs_cleanup:
+            temp_input = target
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            exe,
+            str(project_root), "re",
+            "-import", str(target),
+            "-postScript", "DumpAll.java", str(out_file),
+            "-scriptPath", str(SCRIPT_DIR),
+            "-deleteProject",
+            "-analysisTimeoutPerFile", "600",
+        ] + loader
+        result = engines.run(command, timeout=timeout, env=env)
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        marker = "RE_DONE "
+        if marker not in text:
+            tail = "\n".join(text.strip().splitlines()[-8:])
+            raise ReError("Ghidra 批量反编译没给出结果", hint=tail[:400])
+        return text.split(marker, 1)[1].splitlines()[0].strip()
+    finally:
+        if temp_input and temp_input.exists():
+            temp_input.unlink()
+        shutil.rmtree(project_root, ignore_errors=True)
+
+
 def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
               timeout: int = DEFAULT_TIMEOUT) -> dict:
     exe = engines.require("ghidra")

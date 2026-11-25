@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, armvec, diff, disasm, engines, firmware, decompile, mem, native, proto, unpack
+from . import __version__, armvec, decompile, diff, disasm, engines, firmware, fwmap, mem, native, proto, unpack
 from .detect import FileInfo, entropy, packed_reasons, sniff
 from .errors import ReError
 from .out import emit, human_size, warn
@@ -147,6 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frame", type=int, default=None, help="帧长（字节）")
     p.add_argument("--max", type=int, default=8, help="最多打印几帧（默认 8）")
     p.set_defaults(func=cmd_proto)
+
+    p = sub.add_parser("decompile-all", help="把所有函数反编译到一个 .c（Ghidra，一次分析）")
+    p.add_argument("path")
+    p.add_argument("-o", "--out", default=None, help="输出 .c 文件")
+    p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址")
+    p.add_argument("--timeout", type=int, default=900, help="超时秒数（默认 900）")
+    p.set_defaults(func=cmd_decompile_all)
+
+    p = sub.add_parser("fwmap", help="固件结构：全量反汇编 + 函数地图 + 外设引用")
+    p.add_argument("path")
+    p.add_argument("-o", "--out", default=None, help="输出目录（默认 <文件名>.fwmap）")
+    p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址")
+    p.set_defaults(func=cmd_fwmap)
 
     p = sub.add_parser("unpack", help="剥包：zip/apk/jar/asar/tar/gz/xz/zst/cab/msi/pyinstaller")
     p.add_argument("path")
@@ -439,6 +452,33 @@ def cmd_proto(args):
         "constant": const,
         "varying": varying,
     })
+    return 0
+
+
+def cmd_decompile_all(args):
+    path = Path(args.path)
+    out = Path(args.out) if args.out else path.with_suffix(".all.c")
+    stat = decompile.decompile_all(path, out, args.base, timeout=args.timeout)
+    lines = [f"输出     {out}", f"函数     {stat}（成功/总数）"]
+    emit(args, lines, {"path": str(path), "out": str(out), "stat": stat})
+    return 0
+
+
+def cmd_fwmap(args):
+    path = Path(args.path)
+    out = Path(args.out) if args.out else path.with_name(path.stem + ".fwmap")
+    result = fwmap.run(path, out, args.base)
+    top = sorted(result["peripherals"], key=lambda p: -p["count"])[:5]
+    lines = [
+        f"输出     {out}",
+        f"函数     {len(result['functions'])} 个",
+        f"外设     {len(result['peripherals'])} 个地址",
+        f"映像     {result['size']:,} 字节，基址 {result['base']:#010x}",
+    ]
+    for item in top:
+        lines.append(f"  {item['addr']:#010x}  {item['kind']:<22} {item['count']:>3} 次")
+    emit(args, lines, {"out": str(out), "functions": len(result["functions"]),
+                       "peripherals": len(result["peripherals"]), "base": result["base"]})
     return 0
 
 

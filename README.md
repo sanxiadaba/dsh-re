@@ -16,6 +16,8 @@
 
 ## 安装
 
+需要 Python 3.11+（只用到了标准库加四个解析库，没有别的前置）。
+
 ```powershell
 git clone https://github.com/sanxiadaba/dsh-re.git
 cd dsh-re
@@ -37,12 +39,13 @@ re fw firmware.hex                 # 向量表、Reset、中断、代码区
 re dis firmware.hex --at 0x08000114 -n 16
 re decompile firmware.hex --at 0x08000114
 
-re id PowerWriter.exe
-re pe PowerWriter.exe
-re strings PowerWriter.exe -k path -l 20
+re id app.exe
+re pe app.exe
+re strings app.exe -k path -l 20
 re diff old.exe new.exe
 
 re unpack app.asar -o app.unpacked
+re fwmap firmware.hex -o fwmap-out      # 反汇编 + 函数地图 + 外设引用，一次出齐
 ```
 
 ## 命令
@@ -54,6 +57,7 @@ re unpack app.asar -o app.unpacked
 | `pe` / `elf` | 节区、导入导出、资源、加固 |
 | `hex` | Intel HEX / S-record：段表、校验、转 BIN |
 | `fw` | Cortex-M 向量表、入口、中断 |
+| `fwmap` | 固件结构：全量反汇编 + 函数地图 + 外设引用 |
 | `dis` / `funcs` / `xref` | 反汇编、函数表、交叉引用（rizin） |
 | `decompile` | 反编译一个函数（Ghidra） |
 | `diff` | 两版：字节段差异 + 结构差异 |
@@ -67,7 +71,7 @@ re unpack app.asar -o app.unpacked
 仓库根目录就是 skill 目录（`SKILL.md` 在这里）。用 junction 指过来，本机不留副本：
 
 ```powershell
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\skills\re" -Target "D:\repo\z_code\Git\dsh-re"
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\skills\re" -Target "<仓库所在的绝对路径>"
 ```
 
 ## 数据目录

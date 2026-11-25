@@ -179,6 +179,23 @@ class DiffTests(unittest.TestCase):
         self.assertEqual(diff._blocks(b"x" * 100, b"x" * 100), [])
 
 
+class FwmapTests(unittest.TestCase):
+    def test_classify(self):
+        from pwre.fwmap import classify
+
+        self.assertEqual(classify(0x40021000), "APB 外设")
+        self.assertEqual(classify(0xE000E018), "Cortex-M 内核（SCB/NVIC/SysTick）")
+        self.assertIsNone(classify(0x08000000))
+
+    def test_disassemble_skips_invalid(self):
+        from pwre.fwmap import disassemble
+
+        rows = disassemble(b"\x00\xbf\x00\xbf", 0x08000000)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["asm"], "nop")
+        self.assertEqual(rows[0]["addr"], 0x08000000)
+
+
 class AsarTests(unittest.TestCase):
     def test_extract_and_verify(self):
         import hashlib
