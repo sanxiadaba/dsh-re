@@ -21,6 +21,13 @@ def _blocks(a: bytes, b: bytes) -> list[tuple[int, int]]:
             start = offset
     if start is not None:
         ranges.append((start, limit))
+    # 尾部长度不同，多出来的部分本身就是差异
+    if len(a) != len(b):
+        tail = max(len(a), len(b))
+        if ranges and ranges[-1][1] == limit:
+            ranges[-1] = (ranges[-1][0], tail)
+        else:
+            ranges.append((limit, tail))
     return ranges
 
 

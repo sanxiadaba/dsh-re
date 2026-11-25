@@ -85,7 +85,7 @@ def entropy(data: bytes) -> float:
     for byte in data:
         counts[byte] += 1
     total = len(data)
-    return -sum((c / total) * math.log2(c / total) for c in counts if c)
+    return max(0.0, -sum((c / total) * math.log2(c / total) for c in counts if c))
 
 
 def looks_text(data: bytes) -> bool:

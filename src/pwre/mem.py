@@ -29,7 +29,19 @@ def _kernel32():
 
 
 def _psapi():
-    return ctypes.WinDLL("psapi", use_last_error=True)
+    ps = ctypes.WinDLL("psapi", use_last_error=True)
+    ps.EnumProcessModulesEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+    ]
+    ps.EnumProcessModulesEx.restype = wintypes.BOOL
+    ps.GetModuleInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    ps.GetModuleInformation.restype = wintypes.BOOL
+    ps.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD]
+    ps.GetModuleBaseNameW.restype = wintypes.DWORD
+    return ps
 
 
 def list_processes(filt: str = "") -> list[dict]:

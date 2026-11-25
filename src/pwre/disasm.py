@@ -162,9 +162,9 @@ def _guard_packed(path: Path, force: bool) -> None:
 
 
 def functions(path: Path, limit: int = 60, arch: str | None = None, bits: int | None = None,
-              deep: bool = False, force: bool = False):
+              deep: bool = False, force: bool = False, base: int | None = None):
     _guard_packed(path, force)
-    with target(path, arch, bits, None) as ctx:
+    with target(path, arch, bits, base) as ctx:
         args = ctx.prefix[:]
         for command in _seed_commands(ctx):
             args += ["-c", command]
@@ -179,9 +179,9 @@ def functions(path: Path, limit: int = 60, arch: str | None = None, bits: int | 
 
 
 def xrefs(path: Path, at: int, arch: str | None = None, bits: int | None = None,
-          deep: bool = False, force: bool = False):
+          deep: bool = False, force: bool = False, base: int | None = None):
     _guard_packed(path, force)
-    with target(path, arch, bits, None) as ctx:
+    with target(path, arch, bits, base) as ctx:
         args = ctx.prefix[:]
         for command in _seed_commands(ctx):
             args += ["-c", command]

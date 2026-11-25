@@ -5,6 +5,7 @@ import hashlib
 import json
 import lzma
 import bz2
+import os
 import shutil
 import subprocess
 import tarfile
@@ -17,13 +18,26 @@ from .errors import ReError
 
 def _write(dest: Path, name: str, data: bytes) -> dict:
     target = dest / name
+    # 兜底：拼出来的路径必须仍在 dest 里
+    if not str(target.resolve()).startswith(str(dest.resolve()) + os.sep):
+        raise ReError(f"包里的路径跑到解压目录外了，拒绝写：{name}")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     return {"path": str(target), "size": len(data)}
 
 
 def _safe_name(name: str) -> str:
-    parts = [part for part in name.replace("\\", "/").split("/") if part not in ("", ".", "..")]
+    """只接受包内的相对路径；盘符、绝对路径、.. 一律拒绝。"""
+    raw = name.replace("\\", "/")
+    if raw.startswith("/") or (len(raw) >= 2 and raw[1] == ":"):
+        raise ReError(f"包里有绝对路径/盘符，拒绝解压：{name}")
+    parts = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ReError(f"包里有 .. 路径，拒绝解压：{name}")
+        parts.append(part)
     if not parts:
         raise ReError(f"包里有不安全的路径：{name}")
     return "/".join(parts)

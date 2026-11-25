@@ -11,6 +11,7 @@
 
 import bisect
 import json
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -177,12 +178,13 @@ def run(path: Path, out_dir: Path, base: int | None = None) -> dict:
     from . import disasm as disasm_mod
 
     try:
-        raw, _total = disasm_mod.functions(path, limit=100_000)
+        raw, _total = disasm_mod.functions(path, limit=100_000, base=base)
         funcs = [
             {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
             for row in raw
         ]
-    except ReError:
+    except ReError as exc:
+        print(f"警告：函数表拿不到（{exc}），只做线性反汇编", file=sys.stderr)
         funcs = []
     result = analyze(insns, code, base, funcs)
     result["image"] = str(path)

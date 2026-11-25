@@ -28,7 +28,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         parser.print_help()
-        return 0
+        return 2
     try:
         return args.func(args)
     except ReError as exc:
@@ -366,7 +366,7 @@ def cmd_dis(args):
 
 def cmd_funcs(args):
     path = Path(args.path)
-    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force)
+    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force, base=args.base)
     rows.sort(key=lambda row: row.get("size", 0) or 0, reverse=True)
     rows = rows[: args.limit]
     lines = [f"函数     {total} 个" + (f"，按大小列前 {len(rows)}" if total > len(rows) else "")]
@@ -382,7 +382,7 @@ def cmd_funcs(args):
 
 def cmd_xref(args):
     path = Path(args.path)
-    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force)
+    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force, base=args.base)
     lines = [f"引用     0x{args.at:x} 的位置共 {len(rows)} 处"]
     for row in rows:
         lines.append(f"  {row.get('from', 0):#010x}  {row.get('type', ''):<8} {row.get('opcode', '')}")
@@ -428,6 +428,8 @@ def cmd_mem(args):
         return 0
     if args.addr is None or args.size is None:
         raise ReError("dump 要给 --addr 和 --size", hint="例：--pid 1234 --addr 0x400000 --size 0x1000")
+    if not 0 < args.size <= 64 << 20:
+        raise ReError(f"--size 要在 1 到 64 MiB 之间，收到 {args.size}")
     if args.out:
         count = mem.dump(args.pid, args.addr, args.size, Path(args.out))
         emit(args, [f"写出     {args.out}（{count:,} 字节，pid {args.pid}，{args.addr:#x}）"],
