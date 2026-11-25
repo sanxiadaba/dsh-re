@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pwre"
+version = "0.1.0"
+description = "DSH 用的逆向军刀：一条命令看清一个二进制、一个固件、一个安装包"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "pefile>=2023.2.7",
+    "pyelftools>=0.31",
+    "capstone>=5.0",
+    "zstandard>=0.22",
+]
+
+[project.scripts]
+re = "pwre.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
