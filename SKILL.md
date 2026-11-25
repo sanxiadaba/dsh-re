@@ -1,3 +1,13 @@
+---
+name: re
+description: >
+  逆向工程军刀：认格式、看固件向量表、反汇编、反编译、剥包、比两版、看运行时内存与报文。
+  遇到 .hex/.srec/.bin 固件、PE/ELF 的 exe/dll、asar/APK/zip/MSI/CAB 安装包，或者要回答
+  "这是什么""这版改了什么""这串报文哪些位在变""这个函数在干什么"时用。
+  Triggers: 逆向, 反编译, 脱壳, 固件分析, 向量表, 拆包, 二进制对比, 协议字段,
+  reverse engineering, decompile, unpack, firmware, binary diff.
+---
+
 # re：逆向军刀
 
 看清一个**已经编译/打包好的东西**：固件、PE/ELF、安装包、asar、APK、两版差异。
