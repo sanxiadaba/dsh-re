@@ -24,9 +24,6 @@ ENGINES = {
     "rizin": "反汇编 / 函数识别 / 交叉引用（缺了 re dis、re funcs、re xref 不可用）",
     "ghidra": "反编译（缺了 re decompile 不可用）",
     "java": "Ghidra 需要 JDK（版本由 Ghidra 自己声明的最低版本决定）",
-    "jadx": "APK / DEX 反编译（缺了 re unpack 的 dex 分支不可用）",
-    "ilspycmd": ".NET 反编译",
-    "frida": "运行时插桩与内存抓取",
 }
 
 
@@ -95,9 +92,6 @@ def tool_path(name: str) -> str | None:
         "rizin": rizin_path(),
         "ghidra": ghidra_headless(),
         "java": java_path(),
-        "jadx": _which("jadx"),
-        "ilspycmd": _which("ilspycmd"),
-        "frida": _which("frida"),
     }.get(name)
 
 

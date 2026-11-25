@@ -21,9 +21,6 @@ def _blocks(a: bytes, b: bytes) -> list[tuple[int, int]]:
             start = offset
     if start is not None:
         ranges.append((start, limit))
-    if len(a) != len(b):
-        tail = min(len(a), len(b))
-        ranges.append((tail, max(len(a), len(b))))
     return ranges
 
 
@@ -73,6 +70,8 @@ def compare(a: Path, b: Path) -> tuple[list[str], dict]:
         f"B        {b.name}  {len(raw_b):,} 字节  熵 {entropy(raw_b[:2 << 20]):.2f}",
         f"相同     {same_pct:.2f}%（按 {BLOCK} 字节块）",
     ]
+    if len(raw_a) != len(raw_b):
+        lines.append(f"大小     B 比 A {'多' if len(raw_b) > len(raw_a) else '少'} {abs(len(raw_b) - len(raw_a)):,} 字节")
     if ranges:
         lines.append(f"差异     {len(ranges)} 段，共 {changed:,} 字节")
         for start, end in ranges[:5]:
@@ -101,6 +100,8 @@ def compare(a: Path, b: Path) -> tuple[list[str], dict]:
                 lines.append(f"  {name:<10} 只在 A")
             elif left == right:
                 lines.append(f"  {name:<10} 相同")
+            elif not left["raw"] and not right["raw"]:
+                lines.append(f"  {name:<10} 虚拟大小 {left['vsize']:,}→{right['vsize']:,} 字节（文件里都没有原始数据）")
             else:
                 lines.append(
                     f"  {name:<10} 不同：文件 {left['raw']:,}→{right['raw']:,} 字节，"

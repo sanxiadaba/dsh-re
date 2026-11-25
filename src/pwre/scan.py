@@ -33,12 +33,22 @@ def scan_file(path, min_len: int = 4, utf16: bool = True):
 
 
 def interesting(text: str) -> str | None:
-    """粗分类，只用来过滤噪声，不当结论。"""
+    """粗分类，只用来过滤噪声，不当结论。
+
+    宁可漏，不可错：URL 和路径都要有像样的长度和结构，否则
+    `j:/(` 这种碎片会被当成路径，过滤就白做了。
+    """
     lowered = text.lower()
-    if lowered.startswith(("http://", "https://", "ws://", "wss://", "ftp://")):
+    size = len(text)
+    if size >= 8 and lowered.startswith(("http://", "https://", "ws://", "wss://", "ftp://")):
         return "url"
-    if re.search(r"^[a-z]:[\\/]|^\\\\|/usr/|/opt/|/etc/|/system/", lowered):
-        return "path"
+    if size >= 6:
+        if re.match(r"^[a-z]:[\\/][a-z0-9_\-.\\ ]{3,}", lowered):
+            return "path"
+        if lowered.startswith("\\\\") and size >= 8:
+            return "path"
+        if re.match(r"^/(usr|opt|etc|var|home|root|data|system|sdcard|proc|sys)/", lowered):
+            return "path"
     if re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.]+", text):
         return "email"
     if re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}(:\d+)?", text):

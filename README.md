@@ -58,6 +58,8 @@ re unpack app.asar -o app.unpacked
 | `decompile` | 反编译一个函数（Ghidra） |
 | `diff` | 两版：字节段差异 + 结构差异 |
 | `unpack` | zip / apk / jar / asar / tar / gz / xz / zst / cab / msi / PyInstaller |
+| `mem` | 列进程、列模块、按地址 dump（Windows） |
+| `proto` | 抓包按帧切分，指出恒定位与变化位 |
 | `doctor` / `setup` | 体检、装引擎 |
 
 ## 装成 DSH skill

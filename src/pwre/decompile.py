@@ -1,7 +1,8 @@
 """反编译：Ghidra headless。
 
 固件先摊平成一段并按向量表推处理器；PE/ELF 让 Ghidra 自己认。
-每次调用都会重新导入分析，所以第一次会慢——慢是能力的一部分，不糊弄。
+结果由脚本写到文件，stdout 只用来判断成败——Ghidra 的日志不会污染反编译结果。
+每次调用都会重新导入分析，所以第一次慢；慢是能力的一部分，不糊弄。
 """
 
 import os
@@ -28,7 +29,7 @@ def _processor_for(image) -> str:
 
 
 def _prepare(path: Path, base: int | None):
-    """返回 (输入文件, loader 参数列表)。"""
+    """返回 (输入文件, loader 参数列表, 是否需要之后删除)。"""
     kind = sniff(path).kind
     if kind in ("ihex", "srec"):
         image = firmware.load(path, base)
@@ -41,36 +42,35 @@ def _prepare(path: Path, base: int | None):
         loader = ["-loader", "BinaryLoader", "-loader-baseAddr", hex(flat_base)]
         if processor:
             loader += ["-processor", processor]
-        return temp, loader
+        return temp, loader, True
     if base is not None:
         loader = ["-loader", "BinaryLoader", "-loader-baseAddr", hex(base)]
-        return path, loader
-    return path, []
+        return path, loader, False
+    return path, [], False
 
 
 def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
               timeout: int = DEFAULT_TIMEOUT) -> dict:
     exe = engines.require("ghidra")
     java = engines.require("java")
-    if not java:
-        raise ReError("Ghidra 需要 Java", hint="re setup --java")
     env = dict(os.environ)
     env["JAVA_HOME"] = str(Path(java).parent.parent)
 
     project_root = Path(tempfile.mkdtemp(prefix="re-proj-", dir=str(engines.data_dir())))
     temp_input = None
     try:
-        target, loader = _prepare(path, base)
-        if target != path:
+        target, loader, needs_cleanup = _prepare(path, base)
+        if needs_cleanup:
             temp_input = target
         arg = f"0x{at:08x}" if at is not None else (f"sym:{sym}" if sym else "")
         if not arg:
             raise ReError("要给 --at 或 --sym", hint="先用 re fw / re funcs 找地址")
+        out_file = project_root / "decompiled.c"
         command = [
             exe,
             str(project_root), "re",
             "-import", str(target),
-            "-postScript", "DumpFunction.java", arg,
+            "-postScript", "DumpFunction.java", arg, str(out_file),
             "-scriptPath", str(SCRIPT_DIR),
             "-deleteProject",
             "-analysisTimeoutPerFile", "180",
@@ -85,14 +85,12 @@ def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
         if "RE_FAILED" in text:
             detail = text.split("RE_FAILED", 1)[1].splitlines()[0].strip()
             raise ReError(f"Ghidra 反编译失败：{detail}")
-        marker = text.find("RE_FUNC ")
-        if marker < 0:
-            tail = text.strip().splitlines()[-8:]
-            raise ReError("Ghidra 没给出结果", hint="\n".join(tail)[:400])
-        lines = text[marker:].splitlines()
+        if not out_file.is_file() or not out_file.read_text(encoding="utf-8").strip():
+            tail = "\n".join(text.strip().splitlines()[-8:])
+            raise ReError("Ghidra 没给出结果", hint=tail[:400] or "确认引擎与 JDK 都在（re doctor）")
+        lines = out_file.read_text(encoding="utf-8").splitlines()
         _, name, entry = lines[0].split(" ", 2)
-        body = "\n".join(lines[1:]).strip()
-        return {"name": name, "entry": entry, "c": body}
+        return {"name": name, "entry": entry.strip(), "c": "\n".join(lines[1:]).strip()}
     finally:
         if temp_input and temp_input.exists():
             temp_input.unlink()
