@@ -178,7 +178,7 @@ def run(path: Path, out_dir: Path, base: int | None = None) -> dict:
     from . import disasm as disasm_mod
 
     try:
-        raw, _total = disasm_mod.functions(path, limit=100_000, base=base)
+        raw, _total = disasm_mod.functions(path, limit=100_000, arch="arm", bits=16, base=base)
         funcs = [
             {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
             for row in raw

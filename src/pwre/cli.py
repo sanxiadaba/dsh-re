@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--arch", default=None)
     p.add_argument("--bits", type=int, default=None)
     p.add_argument("--deep", action="store_true", help="深度分析（aaaa，慢；PE 上可能几十秒）")
+    p.add_argument("--base", type=_number, default=None, help="裸二进制的加载地址")
     p.add_argument("--force", action="store_true", help="文件疑似加壳也硬跑")
     p.set_defaults(func=cmd_funcs)
 
@@ -121,6 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--arch", default=None)
     p.add_argument("--bits", type=int, default=None)
     p.add_argument("--deep", action="store_true", help="深度分析（aaaa，慢）")
+    p.add_argument("--base", type=_number, default=None, help="裸二进制的加载地址")
     p.add_argument("--force", action="store_true", help="文件疑似加壳也硬跑")
     p.set_defaults(func=cmd_xref)
 
@@ -366,7 +368,7 @@ def cmd_dis(args):
 
 def cmd_funcs(args):
     path = Path(args.path)
-    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force, base=args.base)
+    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None))
     rows.sort(key=lambda row: row.get("size", 0) or 0, reverse=True)
     rows = rows[: args.limit]
     lines = [f"函数     {total} 个" + (f"，按大小列前 {len(rows)}" if total > len(rows) else "")]
@@ -382,7 +384,7 @@ def cmd_funcs(args):
 
 def cmd_xref(args):
     path = Path(args.path)
-    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force, base=args.base)
+    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None))
     lines = [f"引用     0x{args.at:x} 的位置共 {len(rows)} 处"]
     for row in rows:
         lines.append(f"  {row.get('from', 0):#010x}  {row.get('type', ''):<8} {row.get('opcode', '')}")
