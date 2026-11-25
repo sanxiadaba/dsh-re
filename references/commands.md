@@ -1,6 +1,6 @@
 # 命令参考
 
-只写参数与行为，套路在 `recipes.md`。
+只写参数与行为，套路在 `recipes.md`。文中 `re` 指 `re.cmd`（Windows）或 `re.sh`（Linux/macOS）；`--json` 放在子命令前后都行。
 
 ## 全局
 
@@ -9,7 +9,7 @@
 | `--json` | 输出完整 JSON（默认是给人读的紧凑文本） |
 | `--version` | 版本 |
 
-退出码：`0` 成功；`1` 有结果但发现问题（校验错、段重叠等，已写进输出）；`2` 参数/环境不对；`3` 工具内部错误。
+退出码：`0` 成功；`1` 有结果但有问题（校验错、缺引擎等，原因已写进输出）；`2` 参数不对；`3` 工具内部错误。
 
 ## re id
 
@@ -74,7 +74,7 @@ re fwmap 文件 [-o 输出目录] [--base 0x08000000]
 re funcs 文件 [-l 40] [--arch arm] [--bits 16] [--deep] [--force]
 ```
 
-- 固件：先用向量表当函数根，再 `aaaa` 深分析（32 KB 固件约 2–3 秒）。
+- 固件：先用向量表当函数根，再 `aaaa` 深分析。
 - PE/ELF：默认 `aa` 浅扫；`--deep` 才 `aaaa`。
 - 文件疑似加壳时直接拒绝（静态分析只会得到垃圾，还可能跑很久），`--force` 才硬跑。
 
@@ -143,7 +143,7 @@ re proto 抓包.bin --frame 16 [--max 8]
 
 ```
 re doctor
-re setup --rizin | --ghidra | --java | --all
+re setup --rizin --ghidra     # 可以一次给多个；--all 装全部
 ```
 
 引擎装到 `%LOCALAPPDATA%\dsh-re\engines`（可用 `DSH_RE_DATA` 改），不进仓库、不进 PATH。

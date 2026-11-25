@@ -1,6 +1,6 @@
 # 场景配方
 
-每条都是"从拿到文件到能说人话"的最短路径。命令里的地址换成你实际看到的。
+每条都是"从拿到文件到能下结论"的最短路径。命令里的地址换成你实际看到的。不知道该走哪条？先 `re id`，再按下面 9 条对号。
 
 ## 1. 陌生固件（HEX / S-record / bin）
 
@@ -9,7 +9,7 @@ re id firmware.hex          # 先确认是 Intel HEX 还是裸 BIN
 re hex firmware.hex         # 段、范围、空洞、校验
 re fw firmware.hex          # SP / Reset / 异常 / 中断表 / 代码区
 re dis firmware.hex --at <Reset> -n 40
-re funcs firmware.hex       # 203 个函数里挑最大的几个
+re funcs firmware.hex       # 按大小排，挑最大的几个看
 re decompile firmware.hex --at <大函数地址>
 ```
 
@@ -67,13 +67,13 @@ re strings apk_unpacked\classes.dex -n 6 -k url
 re id apk_unpacked\lib\arm64-v8a\libfoo.so
 ```
 
-DEX 反编译需要 jadx（`re doctor` 会报缺）；`.so` 按 ELF 处理。
+DEX 反编译要另装 jadx（不在 `re` 里）；`.so` 按 ELF 处理。
 
 ## 7. .NET
 
 ```powershell
 re id app.exe               # 看导入里有没有 mscoree / 节名 .NET 特征
-ilspycmd app.exe -o out     # ilspycmd 在 PATH 上时直接反编译
+ilspycmd app.exe -o out     # 需要另装 ilspycmd
 ```
 
 ## 8. 协议字段

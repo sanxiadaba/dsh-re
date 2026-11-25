@@ -13,6 +13,7 @@ description: >
 看清一个**已经编译/打包好的东西**：固件、PE/ELF、安装包、asar、APK、两版差异。
 有源码的问题不要用本 skill，直接读源码。
 
+第一次用先按仓库 README 建 venv 并装 rizin（`re setup --rizin`）。
 命令就是本目录下的 `re.cmd`（Linux/macOS 用 `re.sh`）。DSH 加载时会给出 Base directory，
 用它拼：`& "<base>\re.cmd" ...`。如果 `re` 已在 PATH 上，直接 `re ...`。
 
@@ -55,9 +56,10 @@ re setup --ghidra    # 反编译（自动带 JDK）
 | `re fw 文件 [--vectors]` | Cortex-M：SP、Reset、异常、中断表、代码区 |
 | `re fwmap 文件 [-o 目录]` | 一次产出全量反汇编、函数地图、外设引用（固件结构分析） |
 | `re funcs 文件 [--deep]` | 函数表；固件用向量表当根，PE 默认浅扫 |
-| `re dis 文件 --at 0x... -n 20` | 反汇编；不给 `--at` 时从入口/Reset 开始 |
+| `re dis 文件 --at 0x... -n 20` | 反汇编；不给 `--at` 时从入口/Reset 开始；有符号用 `--sym` |
 | `re xref 文件 --at 0x...` | 谁引用这个地址 |
 | `re decompile 文件 --at 0x...` | 反编译一个函数（Ghidra，首次较慢） |
+| `re decompile-all 文件 -o all.c` | 所有函数反编译到一个文件 |
 | `re diff A B` | 两版差在哪 |
 | `re unpack 文件 [-o 目录]` | 剥包：zip/apk/jar/asar/tar/gz/xz/zst/cab/msi/pyinstaller |
 | `re mem` | 列进程、列模块、按地址 dump（Windows） |
@@ -68,7 +70,6 @@ re setup --ghidra    # 反编译（自动带 JDK）
 
 - 默认是给人读的紧凑文本，控制在十几行；要全量加 `--json`。
 - 地址一律十六进制带前缀，偏移一律文件内偏移。
-- 退出码：`0` 成功；`1` 有结果但有问题（校验错等，已写在输出里）；`2` 参数/环境不对；`3` 工具自身错误。
 
 ## 硬规则
 
@@ -76,13 +77,5 @@ re setup --ghidra    # 反编译（自动带 JDK）
 - **不猜**：认不出架构、找不到向量表、哈希不符，都会明确报错，不返回半成品。
 - **不硬来**：加壳文件跑 `re funcs` 会被拒绝（静态分析只会得到垃圾），先 `re unpack` 或从内存 dump。
 - **不特例**：不认识项目名、不认识芯片型号；一切从文件内容推。
-
-## 典型路线
-
-- **陌生固件**：`re id` → `re hex`（段与空洞）→ `re fw`（向量表）→ `re dis --at <Reset>` → `re funcs` → 挑大的 `re decompile`
-- **加壳 exe**：`re id`（看壳与入口所在段）→ 静态到此为止 → dump 内存后再 `re id` / `re funcs`
-- **两版对比**：`re diff old.exe new.exe` → 差异段 → `re pe` 看节/导入变化
-- **安装包**：`re id` → `re unpack` → 对里面最大的 exe 重跑 `re id`
-- **APK/asar**：`re unpack` → `re strings` 找接口与密钥 → dex/js 再单独看
 
 细节参数见 `references/commands.md`，场景配方见 `references/recipes.md`。

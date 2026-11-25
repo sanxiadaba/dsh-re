@@ -64,7 +64,18 @@ def _load_vectors(image) -> list[int]:
 @contextmanager
 def target(path: Path, arch: str | None = None, bits: int | None = None, base: int | None = None):
     """产出 Target：前缀参数、文件、基址、函数种子。"""
-    kind = sniff(path).kind
+    info = sniff(path)
+    kind = info.kind
+    if kind == "text":
+        raise ReError(
+            f"这是文本文件（{info.label}），不能反汇编",
+            hint="先 re id 确认是什么；文本内容用 re strings 看，打包文件用 re unpack",
+        )
+    if kind == "unknown" and base is None:
+        raise ReError(
+            "未识别的裸二进制：反汇编前要给加载地址",
+            hint="先 re fw 看向量表/入口；或者给 --base 0x08000000 --arch arm --bits 16",
+        )
     ctx = Target(prefix=[], file=str(path))
     try:
         if kind in ("ihex", "srec"):

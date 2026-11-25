@@ -14,6 +14,11 @@ from .scan import interesting, scan_file
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 全局开关放子命令后面也认：re id x --json 和 re --json id x 等价
+    if "--json" in argv:
+        argv.remove("--json")
+        argv.insert(0, "--json")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -203,6 +208,17 @@ def _pe_deps(info: FileInfo) -> tuple[list[str], int]:
         dlls.append(entry.dll.decode("latin-1", "replace"))
         count += len(entry.imports or [])
     return dlls, count
+
+
+def _entropy_note(value: float) -> str:
+    """给熵值补一句人话判断。"""
+    if value >= 7.9:
+        return "（接近 8：几乎肯定是压缩或加密）"
+    if value >= 7.0:
+        return "（偏高：可能压缩或加密）"
+    if value <= 1.0:
+        return "（接近 0：大量重复字节）"
+    return ""
 
 
 def cmd_id(args):
@@ -556,6 +572,11 @@ def cmd_hex(args):
 def cmd_fw(args):
     path = Path(args.path)
     info = sniff(path)
+    if info.kind in ("pe", "dll", "elf", "macho", "macho-fat", "wasm", "dex"):
+        raise ReError(
+            f"{path.name} 是 {info.label}，不是固件",
+            hint="看结构用 re pe / re elf；固件是 .hex / .srec，或者带向量表的裸 .bin",
+        )
     image = firmware.load(path, args.base)
     table = armvec.find_table(image, args.base)
     data = armvec.describe(table, image)
@@ -610,7 +631,7 @@ def cmd_doctor(args):
         lines.append(f"缺：{', '.join(missing)}")
         lines.append("装：re setup " + " ".join(f"--{name}" for name in missing))
     emit(args, lines, payload)
-    return 0
+    return 1 if missing else 0
 
 
 def cmd_setup(args):
