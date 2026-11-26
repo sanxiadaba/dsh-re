@@ -160,7 +160,7 @@ def function_map_md(result: dict, limit: int = 40) -> str:
     return "\n".join(rows) + "\n"
 
 
-def run(path: Path, out_dir: Path, base: int | None = None) -> dict:
+def run(path: Path, out_dir: Path, base: int | None = None, partial: bool = False) -> dict:
     """把一套结构分析产出写到 out_dir。"""
     image, code, flat_base = load(path, base)
     if base is None:
@@ -168,8 +168,17 @@ def run(path: Path, out_dir: Path, base: int | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "image.bin").write_bytes(code)
 
-    insns = disassemble(code, base)
-    lines = []
+    # 线性反汇编从第一个向量目标开始：向量表本身是数据，从 0 开始扫只会得到垃圾
+    start_offset = 0
+    try:
+        table = armvec.find_table(image)
+        targets = [value & ~1 for index, value in table.entries if index >= 1 and value & 1]
+        if targets:
+            start_offset = max(0, min(targets) - base - (min(targets) - base) % 2)
+    except ReError:
+        start_offset = 0
+    insns = disassemble(code[start_offset:], base + start_offset)
+    lines = [f"# 0x{base:08x}–0x{base + start_offset:08x} 是向量表/头部，未按代码反汇编" if start_offset else "# 全量线性反汇编"]
     for item in insns:
         lines.append(f"{item['addr']:#010x}  {item['bytes']:<12}  {item['asm']}")
     (out_dir / "full.asm").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -179,17 +188,24 @@ def run(path: Path, out_dir: Path, base: int | None = None) -> dict:
 
     try:
         raw, _total = disasm_mod.functions(path, limit=100_000, arch="arm", bits=16, base=base)
-        funcs = [
-            {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
-            for row in raw
-        ]
     except ReError as exc:
-        print(f"警告：函数表拿不到（{exc}），只做线性反汇编", file=sys.stderr)
-        funcs = []
-    result = analyze(insns, code, base, funcs)
+        if not partial:
+            raise ReError(
+                f"函数表拿不到，fwmap 不产出半成品：{exc.message}",
+                hint="先 re setup --rizin；确实只想要线性反汇编就加 --partial",
+            ) from exc
+        print(f"警告：函数表拿不到（{exc}），只做线性反汇编（--partial）", file=sys.stderr)
+        raw = []
+    funcs = [
+        {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
+        for row in raw
+    ]
+    result = analyze(insns, code[start_offset:], base + start_offset, funcs)
     result["image"] = str(path)
     result["base"] = base
     result["size"] = len(code)
+    result["errors"] = image.errors
+    result["degraded"] = not funcs
     (out_dir / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "functions.json").write_text(json.dumps(funcs, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "function-map.md").write_text(function_map_md(result), encoding="utf-8")

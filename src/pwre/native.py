@@ -4,6 +4,28 @@ from pathlib import Path
 
 from .errors import ReError
 
+RESOURCE_TYPES = {
+    1: "CURSOR", 2: "BITMAP", 3: "ICON", 4: "MENU", 5: "DIALOG", 6: "STRINGTABLE",
+    7: "FONTDIR", 8: "FONT", 9: "ACCELERATOR", 10: "RCDATA", 11: "MESSAGETABLE",
+    12: "GROUP_CURSOR", 14: "GROUP_ICON", 16: "VERSION", 17: "DLGINCLUDE",
+    19: "PLUGPLAY", 20: "VXD", 21: "ANICURSOR", 22: "ANIICON", 23: "HTML", 24: "MANIFEST",
+}
+
+
+def version_info(pe) -> dict:
+    """VERSIONINFO 里的产品名/版本/公司——逆向第一眼就该知道这是什么软件。"""
+    out = {}
+    try:
+        for group in pe.FileInfo or []:
+            for entry in group:
+                for table in getattr(entry, "StringTable", []) or []:
+                    for key, value in table.entries.items():
+                        name = key.decode("utf-8", "replace")
+                        out.setdefault(name, value.decode("utf-8", "replace"))
+    except Exception:
+        return out
+    return out
+
 
 def _flags(value: int) -> str:
     parts = []
@@ -13,12 +35,14 @@ def _flags(value: int) -> str:
         parts.append("W")
     if value & 0x40000000:
         parts.append("R")
-    if value & 0x02000000:
-        parts.append("C")
-    if value & 0x04000000:
-        parts.append("I")
+    if value & 0x00000020:
+        parts.append("c")  # CNT_CODE
     if value & 0x00000040:
-        parts.append("D")
+        parts.append("d")  # CNT_INITIALIZED_DATA
+    if value & 0x00000080:
+        parts.append("u")  # CNT_UNINITIALIZED_DATA
+    if value & 0x02000000:
+        parts.append("s")  # MEM_DISCARDABLE
     return "".join(parts) or "-"
 
 
@@ -47,7 +71,13 @@ def pe_report(path: Path) -> tuple[list[str], dict]:
     imports = {}
     for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
         dll = entry.dll.decode("latin-1", "replace")
-        imports[dll] = [imp.name.decode("latin-1", "replace") for imp in entry.imports if imp.name]
+        names = []
+        for imp in entry.imports:
+            if imp.name:
+                names.append(imp.name.decode("latin-1", "replace"))
+            else:
+                names.append(f"#{imp.ordinal}")
+        imports[dll] = names
     if imports:
         lines.append("导入")
         for dll, names in list(imports.items()):
@@ -67,20 +97,32 @@ def pe_report(path: Path) -> tuple[list[str], dict]:
     resources = []
     if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
         for entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
-            resources.append(str(entry.name or entry.id))
+            if entry.name:
+                resources.append(str(entry.name))
+            else:
+                resources.append(RESOURCE_TYPES.get(entry.id, str(entry.id)))
     if resources:
         lines.append(f"资源     {len(resources)} 类：{', '.join(resources[:10])}")
 
-    signed = bool(
-        hasattr(pe, "DIRECTORY_ENTRY_SECURITY")
-        and getattr(pe, "DIRECTORY_ENTRY_SECURITY", None)
-    )
+    info = version_info(pe)
+    if info:
+        keys = ("ProductName", "FileDescription", "FileVersion", "CompanyName", "OriginalFilename")
+        brief = "  ".join(f"{key}={info[key]}" for key in keys if info.get(key))
+        if brief:
+            lines.append(f"版本信息 {brief}")
+
+    # pefile 从不解析 DIRECTORY_ENTRY_SECURITY，只能看数据目录里的实际大小
+    security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+    ]
+    signed = bool(security.Size and security.VirtualAddress)
     lines.append(f"签名     {'有 Authenticode' if signed else '无'}")
     payload = {
         "sections": sections,
         "imports": imports,
         "exports": exports,
         "resources": resources,
+        "version_info": info,
         "signed": signed,
     }
     return lines, payload
@@ -106,22 +148,28 @@ def elf_report(path: Path) -> tuple[list[str], dict]:
             if section["sh_addr"] or section["sh_size"]:
                 lines.append(f"  {row['name']:<20} {row['addr']:#010x}  {row['size']:>9,}  {row['type']}")
 
-        needed, soname, rpath = [], "", ""
+        needed, soname, rpath, runpath = [], "", "", ""
         for section in elf.iter_sections():
             if section.name == ".dynamic":
                 for tag in section.iter_tags():
-                    if tag.entry.d_tag == "DT_NEEDED":
-                        needed.append(tag.entry.d_val)
-                    elif tag.entry.d_tag == "DT_SONAME":
-                        soname = tag.entry.d_val
-                    elif tag.entry.d_tag == "DT_RPATH":
-                        rpath = tag.entry.d_val
+                    kind = tag.entry.d_tag
+                    # pyelftools 已经把 d_val 里的字符串偏移解析成 tag.needed/.soname/.rpath
+                    if kind == "DT_NEEDED":
+                        needed.append(getattr(tag, "needed", str(tag.entry.d_val)))
+                    elif kind == "DT_SONAME":
+                        soname = getattr(tag, "soname", str(tag.entry.d_val))
+                    elif kind == "DT_RPATH":
+                        rpath = getattr(tag, "rpath", str(tag.entry.d_val))
+                    elif kind == "DT_RUNPATH":
+                        runpath = getattr(tag, "runpath", str(tag.entry.d_val))
         if needed:
             lines.append(f"依赖     {', '.join(needed)}")
         if soname:
             lines.append(f"SONAME   {soname}")
         if rpath:
             lines.append(f"RPATH    {rpath}")
+        if runpath:
+            lines.append(f"RUNPATH  {runpath}")
         symbols = 0
         if elf.get_section_by_name(".dynsym"):
             symbols = elf.get_section_by_name(".dynsym").num_symbols()
@@ -138,6 +186,7 @@ def elf_report(path: Path) -> tuple[list[str], dict]:
             "needed": needed,
             "soname": soname,
             "rpath": rpath,
+            "runpath": runpath,
             "dynsym": symbols,
             "hardened": hardened,
         }

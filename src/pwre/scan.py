@@ -1,11 +1,39 @@
-"""字符串扫描：ASCII 与 UTF-16LE，带文件偏移。"""
+"""字符串扫描：ASCII、UTF-16LE/BE，以及 GBK（中文 Windows 程序的主要编码）。
+
+只认 ASCII 会把国内软件的文字全漏掉——Delphi/BCB/MFC 写的界面字符串基本都是 GBK。
+"""
 
 import re
 from pathlib import Path
 
-# 可打印区间：0x20-0x7e，外加制表符之外的控制符一律不算
 ASCII_RE = rb"[\x20-\x7e]{%d,}"
-UTF16_RE = rb"(?:[\x20-\x7e]\x00){%d,}"
+UTF16LE_RE = rb"(?:[\x20-\x7e]\x00){%d,}"
+UTF16BE_RE = rb"(?:\x00[\x20-\x7e]){%d,}"
+GBK_RE = re.compile(rb"(?:[\x81-\xfe][\x40-\xfe]){2,}")
+
+ENCODINGS = ("ascii", "utf16", "utf16be", "gbk")
+
+
+def _is_cjk(ch: str) -> bool:
+    return (
+        "\u4e00" <= ch <= "\u9fff"      # 基本汉字
+        or "\u3400" <= ch <= "\u4dbf"    # 扩展 A
+        or "\u3000" <= ch <= "\u303f"    # 中文标点
+        or "\uff00" <= ch <= "\uffef"    # 全角字符
+    )
+
+
+def _gbk_hits(data: bytes, min_len: int) -> list[tuple[int, str, str]]:
+    hits = []
+    for match in GBK_RE.finditer(data):
+        try:
+            text = match.group().decode("gbk")
+        except UnicodeDecodeError:
+            continue
+        if sum(1 for ch in text if _is_cjk(ch)) < min_len:
+            continue
+        hits.append((match.start(), "gbk", text))
+    return hits
 
 
 def read_bytes(path: Path, limit: int | None = None) -> bytes:
@@ -13,23 +41,29 @@ def read_bytes(path: Path, limit: int | None = None) -> bytes:
         return fh.read(limit) if limit else fh.read()
 
 
-def scan(data: bytes, min_len: int = 4, utf16: bool = True):
+def scan(data: bytes, min_len: int = 4, utf16: bool = True,
+         encodings: tuple[str, ...] = ENCODINGS):
     """产出 (offset, encoding, text)。按偏移排序。"""
     hits = []
     if min_len < 2:
         min_len = 2
-    for match in re.finditer(ASCII_RE % min_len, data):
-        hits.append((match.start(), "ascii", match.group().decode("ascii", "replace")))
-    if utf16:
-        for match in re.finditer(UTF16_RE % min_len, data):
-            text = match.group().decode("utf-16-le", "replace")
-            hits.append((match.start(), "utf16", text))
+    if "ascii" in encodings:
+        for match in re.finditer(ASCII_RE % min_len, data):
+            hits.append((match.start(), "ascii", match.group().decode("ascii", "replace")))
+    if utf16 and "utf16" in encodings:
+        for match in re.finditer(UTF16LE_RE % min_len, data):
+            hits.append((match.start(), "utf16", match.group().decode("utf-16-le", "replace")))
+    if utf16 and "utf16be" in encodings:
+        for match in re.finditer(UTF16BE_RE % min_len, data):
+            hits.append((match.start(), "utf16be", match.group().decode("utf-16-be", "replace")))
+    if "gbk" in encodings:
+        hits.extend(_gbk_hits(data, min_len))
     hits.sort(key=lambda item: item[0])
     return hits
 
 
-def scan_file(path, min_len: int = 4, utf16: bool = True):
-    return scan(read_bytes(Path(path)), min_len=min_len, utf16=utf16)
+def scan_file(path, min_len: int = 4, utf16: bool = True, encodings: tuple[str, ...] = ENCODINGS):
+    return scan(read_bytes(Path(path)), min_len=min_len, utf16=utf16, encodings=encodings)
 
 
 def interesting(text: str) -> str | None:

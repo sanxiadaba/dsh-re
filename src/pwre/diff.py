@@ -13,7 +13,8 @@ def _blocks(a: bytes, b: bytes) -> list[tuple[int, int]]:
     ranges = []
     start = None
     for offset in range(0, limit, BLOCK):
-        same = a[offset: offset + BLOCK] == b[offset: offset + BLOCK]
+        end = min(offset + BLOCK, limit)
+        same = a[offset:end] == b[offset:end]
         if same and start is not None:
             ranges.append((start, offset))
             start = None

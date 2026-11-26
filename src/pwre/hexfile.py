@@ -6,6 +6,10 @@
 
 from .image import Image, Segment
 
+# 每种记录类型的数据字节数；-1 表示不限（数据记录）
+IHEX_DATA_LEN = {0x00: -1, 0x01: 0, 0x02: 2, 0x03: 4, 0x04: 2, 0x05: 4}
+MAX_ERRORS = 100
+
 
 def _merge(segments: list[tuple[int, bytes]]) -> list[Segment]:
     return [Segment(addr, data) for addr, data in segments]
@@ -19,6 +23,8 @@ def parse_ihex(text: str) -> Image:
         line = raw.strip()
         if not line:
             continue
+        if lineno == 1:
+            line = line.lstrip("\ufeff")
         if not line.startswith(":"):
             image.errors.append(f"第 {lineno} 行不是 ': ' 开头：{line[:40]}")
             continue
@@ -32,11 +38,18 @@ def parse_ihex(text: str) -> Image:
             continue
         count, offset, rtype = body[0], (body[1] << 8) | body[2], body[3]
         data = body[4: 4 + count]
-        if len(data) != count:
-            image.errors.append(f"第 {lineno} 行长度不符：声明 {count}，实际 {len(data)}")
+        if len(data) != count or len(body) != count + 5:
+            image.errors.append(f"第 {lineno} 行长度不符：声明 {count}，实际 {len(body) - 5}")
             continue
         if (sum(body) & 0xFF) != 0:
             image.errors.append(f"第 {lineno} 行校验和错")
+            continue
+        if rtype not in IHEX_DATA_LEN:
+            image.errors.append(f"第 {lineno} 行是未知记录类型 0x{rtype:02x}，已忽略")
+            continue
+        want = IHEX_DATA_LEN[rtype]
+        if want >= 0 and count != want:
+            image.errors.append(f"第 {lineno} 行类型 0x{rtype:02x} 要 {want} 字节数据，实际 {count}")
             continue
         image.records += 1
         if rtype == 0x00:
@@ -47,9 +60,14 @@ def parse_ihex(text: str) -> Image:
             upper = int.from_bytes(data, "big") << 4
         elif rtype == 0x04:
             upper = int.from_bytes(data, "big") << 16
-        elif rtype in (0x03, 0x05):
+        elif rtype == 0x03:
+            # CS:IP 两个 16 位字段，线性入口 =(CS<<4)+IP
+            image.start = (int.from_bytes(data[:2], "big") << 4) + int.from_bytes(data[2:], "big")
+        elif rtype == 0x05:
             image.start = int.from_bytes(data, "big")
-        # 其它类型（03/05 之外）按规范忽略
+        if len(image.errors) >= MAX_ERRORS:
+            image.errors.append(f"错误太多，后续不再记录（已到 {MAX_ERRORS} 条上限）")
+            break
     image.segments = _merge(pending)
     image.normalize()
     return image
@@ -65,6 +83,8 @@ def parse_srec(text: str) -> Image:
         line = raw.strip()
         if not line:
             continue
+        if lineno == 1:
+            line = line.lstrip("\ufeff")
         if len(line) < 4 or line[0] != "S" or line[1] not in SREC_ADDR_BYTES:
             image.errors.append(f"第 {lineno} 行不是合法 S-record：{line[:40]}")
             continue
@@ -90,6 +110,9 @@ def parse_srec(text: str) -> Image:
         elif kind in ("7", "8", "9"):
             image.start = addr
         # S0 是文件名头，S5/S6 是记录数，都不进段表
+        if len(image.errors) >= MAX_ERRORS:
+            image.errors.append(f"错误太多，后续不再记录（已到 {MAX_ERRORS} 条上限）")
+            break
     image.segments = _merge(pending)
     image.normalize()
     return image
@@ -98,7 +121,11 @@ def parse_srec(text: str) -> Image:
 def parse(path) -> Image:
     from pathlib import Path
 
-    text = Path(path).read_text(encoding="latin-1")
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
     first = text.lstrip()[:2]
     if first.startswith(":"):
         return parse_ihex(text)
