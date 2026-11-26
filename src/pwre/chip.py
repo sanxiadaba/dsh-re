@@ -135,6 +135,8 @@ def dump(out: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
          devices_xml: str | None = None) -> Path:
     if size <= 0:
         raise ReError(f"--size 必须为正，收到 {size}")
+    if out.exists() and out.is_dir():
+        raise ReError(f"--dump 的目标是个目录：{out}", hint="给一个文件名，例如 chip.bin")
     if out.exists() and not force:
         raise ReError(f"目标已存在：{out}", hint="换个文件名，或加 --force 覆盖")
     work = _workdir()

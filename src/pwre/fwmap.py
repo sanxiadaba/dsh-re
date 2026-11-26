@@ -165,56 +165,56 @@ def run(path: Path, out_dir: Path, base: int | None = None, partial: bool = Fals
     image, code, flat_base = load(path, base)
     if base is None:
         base = flat_base
-    # 先写临时目录，全部成功才搬进 out_dir：失败不留半成品
+    # 先写临时目录，全部成功才搬进 out_dir；失败也要把临时目录清掉
     import shutil
     import tempfile
 
     out_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="fwmap-", dir=str(out_dir.parent)))
-    (work / "image.bin").write_bytes(code)
-
-    # 线性反汇编从第一个向量目标开始：向量表本身是数据，从 0 开始扫只会得到垃圾
-    start_offset = 0
     try:
-        table = armvec.find_table(image)
-        targets = [value & ~1 for index, value in table.entries if index >= 1 and value & 1]
-        if targets:
-            start_offset = max(0, min(targets) - base - (min(targets) - base) % 2)
-    except ReError:
+        (work / "image.bin").write_bytes(code)
+        # 线性反汇编从第一个向量目标开始：向量表本身是数据，从 0 开始扫只会得到垃圾
         start_offset = 0
-    insns = disassemble(code[start_offset:], base + start_offset)
-    lines = [f"# 0x{base:08x}–0x{base + start_offset:08x} 是向量表/头部，未按代码反汇编" if start_offset else "# 全量线性反汇编"]
-    for item in insns:
-        lines.append(f"{item['addr']:#010x}  {item['bytes']:<12}  {item['asm']}")
-    (work / "full.asm").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            table = armvec.find_table(image)
+            targets = [value & ~1 for index, value in table.entries if index >= 1 and value & 1]
+            if targets:
+                start_offset = max(0, min(targets) - base - (min(targets) - base) % 2)
+        except ReError:
+            start_offset = 0
+        insns = disassemble(code[start_offset:], base + start_offset)
+        lines = [f"# 0x{base:08x}–0x{base + start_offset:08x} 是向量表/头部，未按代码反汇编" if start_offset else "# 全量线性反汇编"]
+        for item in insns:
+            lines.append(f"{item['addr']:#010x}  {item['bytes']:<12}  {item['asm']}")
+        (work / "full.asm").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    # 函数边界：优先用向量表当种子，再用 rizin 深扫
-    from . import disasm as disasm_mod
+        from . import disasm as disasm_mod
 
-    try:
-        raw, _total = disasm_mod.functions(path, limit=100_000, arch="arm", bits=16, base=base)
-    except ReError as exc:
-        if not partial:
-            raise ReError(
-                f"函数表拿不到，fwmap 不产出半成品：{exc.message}",
-                hint="先 re setup --rizin；确实只想要线性反汇编就加 --partial",
-            ) from exc
-        print(f"警告：函数表拿不到（{exc}），只做线性反汇编（--partial）", file=sys.stderr)
-        raw = []
-    funcs = [
-        {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
-        for row in raw
-    ]
-    result = analyze(insns, code[start_offset:], base + start_offset, funcs)
-    result["image"] = str(path)
-    result["base"] = base
-    result["size"] = len(code)
-    result["errors"] = image.errors
-    result["degraded"] = not funcs
-    (work / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    (work / "functions.json").write_text(json.dumps(funcs, indent=2, ensure_ascii=False), encoding="utf-8")
-    (work / "function-map.md").write_text(function_map_md(result), encoding="utf-8")
-    for item in sorted(work.iterdir()):
-        shutil.move(str(item), str(out_dir / item.name))
-    shutil.rmtree(work, ignore_errors=True)
+        try:
+            raw, _total = disasm_mod.functions(path, limit=100_000, arch="arm", bits=16, base=base)
+        except ReError as exc:
+            if not partial:
+                raise ReError(
+                    f"函数表拿不到，fwmap 不产出半成品：{exc.message}",
+                    hint="先 re setup --rizin；确实只想要线性反汇编就加 --partial",
+                ) from exc
+            print(f"警告：函数表拿不到（{exc}），只做线性反汇编（--partial）", file=sys.stderr)
+            raw = []
+        funcs = [
+            {"addr": row.get("offset", 0), "size": row.get("size", 0), "name": row.get("name", "?")}
+            for row in raw
+        ]
+        result = analyze(insns, code[start_offset:], base + start_offset, funcs)
+        result["image"] = str(path)
+        result["base"] = base
+        result["size"] = len(code)
+        result["errors"] = image.errors
+        result["degraded"] = not funcs
+        (work / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        (work / "functions.json").write_text(json.dumps(funcs, indent=2, ensure_ascii=False), encoding="utf-8")
+        (work / "function-map.md").write_text(function_map_md(result), encoding="utf-8")
+        for item in sorted(work.iterdir()):
+            shutil.move(str(item), str(out_dir / item.name))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return result
