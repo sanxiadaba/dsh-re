@@ -12,6 +12,7 @@ UTF16BE_RE = rb"(?:\x00[\x20-\x7e]){%d,}"
 GBK_RE = re.compile(rb"(?:[\x81-\xfe][\x40-\xfe]){2,}")
 
 ENCODINGS = ("ascii", "utf16", "utf16be", "gbk")
+MAX_MIN_LEN = 1 << 20  # 再大就不是"最短长度"而是把文件当一条串了
 
 
 def _is_cjk(ch: str) -> bool:
@@ -47,6 +48,14 @@ def scan(data: bytes, min_len: int = 4, utf16: bool = True,
     hits = []
     if min_len < 2:
         min_len = 2
+    if min_len > MAX_MIN_LEN:
+        from .errors import ReError
+
+        raise ReError(
+            f"最短长度 {min_len:,} 太大（上限 {MAX_MIN_LEN:,}）",
+            hint="这只是过滤短串的下限，给个 2–64 就够；要全长文本用 re strings -n 1",
+            code=2,
+        )
     if "ascii" in encodings:
         for match in re.finditer(ASCII_RE % min_len, data):
             hits.append((match.start(), "ascii", match.group().decode("ascii", "replace")))
