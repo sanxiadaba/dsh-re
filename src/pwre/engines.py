@@ -200,8 +200,14 @@ def github_asset_any(repo: str, patterns: list[str]) -> tuple[str, str]:
     import re
 
     api = f"https://api.github.com/repos/{repo}/releases/latest"
-    with _opener().open(_request(api), timeout=20) as response:
-        data = json.load(response)
+    try:
+        with _opener().open(_request(api), timeout=60) as response:
+            data = json.load(response)
+    except Exception as exc:
+        raise ReError(
+            f"查 {repo} 的最新版本失败：{exc}",
+            hint="GitHub API 限流时设 GITHUB_TOKEN；慢网设 HTTPS_PROXY；也可以手动下载后放进 engines 目录",
+        )
     tag = data.get("tag_name", "?")
     assets = data.get("assets", [])
     for pattern in patterns:
@@ -282,14 +288,26 @@ def download(url: str, dest: Path, label: str, retries: int = 5) -> Path:
     return dest
 
 
+def _find_layout(root: Path) -> Path:
+    """在解压结果里找"真正的那一层"：带 bin/rizin 或 support/analyzeHeadless 的目录。"""
+    marks = (
+        Path("bin") / "rizin.exe", Path("bin") / "rizin",
+        Path("support") / "analyzeHeadless.bat", Path("support") / "analyzeHeadless",
+    )
+    for candidate in [root, *sorted(p for p in root.rglob("*") if p.is_dir())]:
+        if any((candidate / mark).is_file() for mark in marks):
+            return candidate
+    entries = [e for e in root.iterdir() if e.name != "__MACOSX"]
+    return entries[0] if len(entries) == 1 and entries[0].is_dir() else root
+
+
 def _extract_zip(archive: Path, target: Path) -> None:
-    """解压并把唯一的顶层目录提升到 target。"""
+    """解压并提升到真正的那一层（不假定只有唯一顶层目录）。"""
     tmp = Path(tempfile.mkdtemp(prefix="re-extract-", dir=str(target.parent)))
     try:
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(tmp)
-        entries = [e for e in tmp.iterdir() if e.name not in ("__MACOSX",)]
-        source = entries[0] if len(entries) == 1 and entries[0].is_dir() else tmp
+        source = _find_layout(tmp)
         if target.exists():
             shutil.rmtree(target)
         if source == tmp:

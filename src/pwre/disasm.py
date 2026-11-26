@@ -17,6 +17,8 @@ from .detect import packed_reasons, sniff
 from .errors import ReError
 from .out import warn
 
+CODE_KINDS = ("pe", "dll", "elf", "macho", "macho-fat", "wasm", "ihex", "srec", "unknown", "dex")
+
 MAX_DIS = 400
 MAX_SEEDS = 64
 
@@ -74,10 +76,10 @@ def target(path: Path, arch: str | None = None, bits: int | None = None, base: i
     """产出 Target：前缀参数、文件、基址、函数种子。"""
     info = sniff(path)
     kind = info.kind
-    if kind == "text":
+    if kind not in CODE_KINDS:
         raise ReError(
-            f"这是文本文件（{info.label}），不能反汇编",
-            hint="先 re id 确认是什么；文本内容用 re strings 看，打包文件用 re unpack",
+            f"这是 {info.label}，不是可反汇编的代码",
+            hint="先 re id 确认是什么；文本用 re strings，压缩包用 re unpack，图片/文档没有代码可看",
         )
     ctx = Target(prefix=[], file=str(path))
     try:

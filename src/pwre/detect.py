@@ -5,6 +5,7 @@ import json
 import math
 import struct
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 PE_MACHINES = {
@@ -73,9 +74,13 @@ class FileInfo:
     entry: int | None = None
     extra: dict = field(default_factory=dict)
 
-    @property
+    @cached_property
     def sha256(self) -> str:
-        return hashlib.sha256(self.path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with open(self.path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
 
 def entropy(data: bytes) -> float:
@@ -287,18 +292,21 @@ def _pe(path: Path, size: int, head: bytes) -> FileInfo:
     label = f"PE{bits} {'DLL' if is_dll else '可执行文件'}"
     if subsystem in PE_SUBSYSTEMS:
         label += f"（{PE_SUBSYSTEMS[subsystem]}）"
-    extra = {
-        "machine": machine,
-        "subsystem": subsystem,
-        "dll": is_dll,
-        "linker": f"{pe.OPTIONAL_HEADER.MajorLinkerVersion}.{pe.OPTIONAL_HEADER.MinorLinkerVersion}",
-        "timestamp": pe.FILE_HEADER.TimeDateStamp,
-        "sections": _pe_sections(pe),
-        "characteristics": pe.FILE_HEADER.Characteristics,
-        "optional": pe.OPTIONAL_HEADER,
-        "file_header": pe.FILE_HEADER,
-        "entry_rva": pe.OPTIONAL_HEADER.AddressOfEntryPoint,
-    }
+    try:
+        extra = {
+            "machine": machine,
+            "subsystem": subsystem,
+            "dll": is_dll,
+            "linker": f"{pe.OPTIONAL_HEADER.MajorLinkerVersion}.{pe.OPTIONAL_HEADER.MinorLinkerVersion}",
+            "timestamp": pe.FILE_HEADER.TimeDateStamp,
+            "sections": _pe_sections(pe),
+            "characteristics": pe.FILE_HEADER.Characteristics,
+            "entry_rva": pe.OPTIONAL_HEADER.AddressOfEntryPoint,
+            "image_base": pe.OPTIONAL_HEADER.ImageBase,
+        }
+        entry = pe.OPTIONAL_HEADER.AddressOfEntryPoint + pe.OPTIONAL_HEADER.ImageBase
+    finally:
+        pe.close()
     extra["entry_section"] = _section_at(extra["sections"], extra["entry_rva"])
     return FileInfo(
         path,
@@ -308,7 +316,7 @@ def _pe(path: Path, size: int, head: bytes) -> FileInfo:
         arch=PE_MACHINES.get(machine, f"machine 0x{machine:04x}"),
         bits=bits,
         endian="little",
-        entry=pe.OPTIONAL_HEADER.AddressOfEntryPoint + pe.OPTIONAL_HEADER.ImageBase,
+        entry=entry,
         extra=extra,
     )
 

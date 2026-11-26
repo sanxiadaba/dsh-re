@@ -170,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--out", default=None, help="输出 .c 文件")
     p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址")
     p.add_argument("--timeout", type=int, default=900, help="超时秒数（默认 900）")
+    p.add_argument("--force", action="store_true", help="输出文件已存在也覆盖")
     p.set_defaults(func=cmd_decompile_all)
 
     p = sub.add_parser("fwmap", help="固件结构：全量反汇编 + 函数地图 + 外设引用")
@@ -344,7 +345,8 @@ def cmd_id(args):
     if info.kind in ("ihex", "srec"):
         lines.append("下一步   re hex 看段与地址，re fw 看向量表与入口")
     elif info.kind == "unknown":
-        samples = [text for _, _, text in scan_file(path, 6) if interesting(text)][:5]
+        blob = path.read_bytes()[: 4 << 20]
+        samples = [text for _, _, text in scan.scan(blob, 6) if interesting(text)][:5]
         if samples:
             lines.append("线索     以下字符串值得先看：")
             lines.extend(f"         {text[:100]}" for text in samples)
@@ -403,9 +405,17 @@ def cmd_strings(args):
 
 def cmd_pe(args):
     path = Path(args.path)
-    kind = sniff(path).kind
+    info = sniff(path)
+    kind = info.kind
     if kind not in ("pe", "dll"):
-        raise ReError(f"{path.name} 不是 PE（识别为 {kind}）", hint="ELF 用 re elf；固件用 re fw")
+        hint = {
+            "elf": "ELF 用 re elf",
+            "apk": "APK 用 re apk（结构）或 re unpack（摊开）",
+            "zip": "压缩包用 re unpack",
+            "ihex": "固件用 re hex / re fw",
+            "srec": "固件用 re hex / re fw",
+        }.get(kind, "先用 re id 看清楚它是什么")
+        raise ReError(f"{path.name} 不是 PE（识别为 {info.label}）", hint=hint)
     lines, payload = native.pe_report(path)
     emit(args, [f"文件     {path}", *lines], {"path": str(path), **payload})
     return 0
@@ -413,9 +423,12 @@ def cmd_pe(args):
 
 def cmd_elf(args):
     path = Path(args.path)
-    kind = sniff(path).kind
+    info = sniff(path)
+    kind = info.kind
     if kind != "elf":
-        raise ReError(f"{path.name} 不是 ELF（识别为 {kind}）", hint="PE 用 re pe")
+        hint = {"pe": "PE 用 re pe", "dll": "PE 用 re pe",
+                "apk": "APK 用 re apk", "zip": "压缩包用 re unpack"}.get(kind, "先用 re id 看清楚")
+        raise ReError(f"{path.name} 不是 ELF（识别为 {info.label}）", hint=hint)
     lines, payload = native.elf_report(path)
     emit(args, [f"文件     {path}", *lines], {"path": str(path), **payload})
     return 0
@@ -551,6 +564,8 @@ def cmd_proto(args):
 def cmd_decompile_all(args):
     path = Path(args.path)
     out = Path(args.out) if args.out else path.with_suffix(".all.c")
+    if out.exists() and not args.force:
+        raise ReError(f"目标已存在：{out}", hint="换个 -o，或加 --force 覆盖")
     stat = decompile.decompile_all(path, out, args.base, timeout=args.timeout)
     lines = [f"输出     {out}", f"函数     {stat}（成功/总数）"]
     emit(args, lines, {"path": str(path), "out": str(out), "stat": stat})

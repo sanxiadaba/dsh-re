@@ -17,13 +17,23 @@ from .detect import packer_name, sniff
 from .errors import ReError
 
 
+MAX_UNPACK = 2 << 30  # 单个包最多解出 2 GiB，防 zip 炸弹
+
+
 def _write(dest: Path, name: str, data: bytes) -> dict:
     target = dest / name
-    # 兜底：拼出来的路径必须仍在 dest 里
-    if not str(target.resolve()).startswith(str(dest.resolve()) + os.sep):
+    # 兜底：拼出来的路径必须仍在 dest 里（commonpath 对卷根也成立）
+    try:
+        inside = os.path.commonpath([str(dest.resolve()), str(target.resolve())]) == str(dest.resolve())
+    except ValueError:
+        inside = False
+    if not inside:
         raise ReError(f"包里的路径跑到解压目录外了，拒绝写：{name}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        raise ReError(f"写不出去：{name}（{exc.strerror or exc}）", hint="目标目录可能只读，或文件名不合法")
     return {"path": str(target), "size": len(data)}
 
 
@@ -57,9 +67,16 @@ def extract_zip(path: Path, dest: Path) -> list[dict]:
     out = []
     try:
         with zipfile.ZipFile(path) as zf:
+            total = 0
             for entry in zf.infolist():
                 if entry.is_dir():
                     continue
+                total += entry.file_size
+                if total > MAX_UNPACK:
+                    raise ReError(
+                        f"解压后超过 {MAX_UNPACK >> 30} GiB（{total:,} 字节），拒绝对付可能的压缩炸弹",
+                        hint="先看看里面最大的条目是什么，再决定要不要解",
+                    )
                 out.append(_write(dest, _safe_name(entry.filename), zf.read(entry)))
     except RuntimeError as exc:
         raise ReError(f"这个包解不开：{exc}", hint="加密包要先解密；不是标准 zip 就用 7z")
@@ -87,15 +104,39 @@ def _decompress(path: Path, dest: Path, opener) -> list[dict]:
         if name.lower().endswith(suffix):
             name = name[: -len(suffix)]
             break
-    with opener(path) as fh:
-        data = fh.read()
-    return [_write(dest, name or path.stem, data)]
+    try:
+        with opener(path) as fh:
+            buffer = bytearray()
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                buffer += chunk
+                if len(buffer) > MAX_UNPACK:
+                    raise ReError(f"解压超过 {MAX_UNPACK >> 30} GiB，停下")
+    except (OSError, EOFError, lzma.LZMAError, gzip.BadGzipFile) as exc:
+        raise ReError(f"压缩流读到一半坏了：{exc}", hint="文件可能截断；重新下载或换来源")
+    return [_write(dest, name or path.stem, bytes(buffer))]
 
 
 def extract_zstd(path: Path, dest: Path) -> list[dict]:
+    """zstd 必须确认帧真的结束了：截断的流不能当成功。"""
     import zstandard
 
-    return _decompress(path, dest, lambda p: zstandard.ZstdDecompressor().stream_reader(open(p, "rb")))
+    obj = zstandard.ZstdDecompressor().decompressobj()
+    name = path.name
+    for suffix in (".zst", ".zstd"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    try:
+        with open(path, "rb") as fh:
+            data = obj.decompress(fh.read())
+    except zstandard.ZstdError as exc:
+        raise ReError(f"zstd 解压失败：{exc}")
+    if not obj.eof:
+        raise ReError("zstd 帧没有正常结束（文件截断）", hint="重新下载或换来源；截断的包不能用")
+    return [_write(dest, name or path.stem, data)]
 
 
 def asar_header(raw: bytes) -> tuple[dict, int]:

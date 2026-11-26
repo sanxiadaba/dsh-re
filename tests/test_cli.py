@@ -42,7 +42,7 @@ class CliTests(unittest.TestCase):
     def test_dis_refuses_text(self):
         done = run("dis", str(self.text))
         self.assertEqual(done.returncode, 1)
-        self.assertIn("文本文件", done.stderr)
+        self.assertIn("不是可反汇编的代码", done.stderr)
 
     def test_dis_refuses_raw_binary_without_base(self):
         done = run("dis", str(self.blob))
