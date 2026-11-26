@@ -2,7 +2,8 @@
 
 静态分析只能回答"文件里是什么"；"芯片里跑的是不是这份"必须去问芯片。
 这个模块用 SEGGER 的 JLink.exe 命令行做四件事：探测、读回、比对、烧写。
-没有 J-Link 就明确报错，不假装能跑。
+没有 J-Link 就明确报错，不假装能跑；所有调用都是 headless（`-NoGui 1` +
+`-ExitOnError 1`），不会弹选择框等人点。
 """
 
 import re
@@ -18,6 +19,9 @@ from .errors import ReError
 DEFAULT_FLASH = 0x08000000
 DEFAULT_SIZE = 0x8000
 DEFAULT_DEVICE = "Cortex-M0"
+
+
+# ------------------------------------------------------------------ 定位
 
 
 def jlink_exe() -> str | None:
@@ -47,9 +51,12 @@ def _workdir() -> Path:
     return Path(tempfile.mkdtemp(prefix="re-chip-", dir=str(engines.data_dir())))
 
 
-def _head(device: str | None, speed: int) -> list[str]:
+def _head(device: str | None, speed: int, devices_xml: str | None = None) -> list[str]:
     # 不给器件名时 J-Link 会弹交互式选择（脚本里就卡住），所以永远显式给一个
-    lines = ["si SWD", f"speed {speed}", f"device {device or DEFAULT_DEVICE}", "connect"]
+    lines = []
+    if devices_xml:
+        lines.append(f"Exec JLinkDevicesXMLPath={devices_xml}")
+    lines += ["si SWD", f"speed {speed}", f"device {device or DEFAULT_DEVICE}", "connect"]
     return lines
 
 
@@ -57,9 +64,18 @@ def _run(script_lines: list[str], cwd: Path, timeout: int = 120) -> str:
     exe = _require()
     script = cwd / "re-chip.jlink"
     script.write_text("\n".join(script_lines + ["q"]) + "\n", encoding="ascii", errors="replace")
-    result = engines.run([exe, "-NoGui", "1", "-CommanderScript", str(script)],
-                         timeout=timeout, cwd=str(cwd))
-    return (result.stdout or "") + "\n" + (result.stderr or "")
+    # -ExitOnError 1：器件名不对/连不上时立刻退出，别掉进 Device> 交互提示
+    result = engines.run(
+        [exe, "-NoGui", "1", "-ExitOnError", "1", "-CommanderScript", str(script)],
+        timeout=timeout, cwd=str(cwd),
+    )
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    if "No valid device has been selected" in text or "Device>" in text:
+        raise ReError(
+            "J-Link 不认识这个器件名",
+            hint="用 --device 指定 J-Link 支持的型号；Keil 的器件包可以 --devices-xml 指过去",
+        )
+    return text
 
 
 def _words(text: str) -> dict[int, int]:
@@ -76,8 +92,9 @@ def _words(text: str) -> dict[int, int]:
     return out
 
 
-def _dump_to(work: Path, base: int, size: int, device: str | None, speed: int) -> bytes:
-    text = _run(_head(device, speed) + [f"savebin flash.bin, {base:#010x}, {size:x}"], work)
+def _dump_to(work: Path, base: int, size: int, device: str | None, speed: int,
+             devices_xml: str | None = None) -> bytes:
+    text = _run(_head(device, speed, devices_xml) + [f"savebin flash.bin, {base:#010x}, {size:x}"], work)
     produced = work / "flash.bin"
     if not produced.is_file() or produced.stat().st_size < size:
         tail = "\n".join(text.strip().splitlines()[-6:])
@@ -85,11 +102,14 @@ def _dump_to(work: Path, base: int, size: int, device: str | None, speed: int) -
     return produced.read_bytes()
 
 
-def probe(device: str | None = None, speed: int = 4000) -> dict:
+# ------------------------------------------------------------------ 四个动作
+
+
+def probe(device: str | None = None, speed: int = 4000, devices_xml: str | None = None) -> dict:
     """连上芯片，读 CPUID、向量表。"""
     work = _workdir()
     try:
-        text = _run(_head(device, speed) + [
+        text = _run(_head(device, speed, devices_xml) + [
             "mem 0xE000ED00, 0x10",
             f"mem {DEFAULT_FLASH:#010x}, 0x40",
         ], work)
@@ -111,10 +131,13 @@ def probe(device: str | None = None, speed: int = 4000) -> dict:
 
 
 def dump(out: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
-         device: str | None = None, speed: int = 4000) -> Path:
+         device: str | None = None, speed: int = 4000, force: bool = False,
+         devices_xml: str | None = None) -> Path:
+    if out.exists() and not force:
+        raise ReError(f"目标已存在：{out}", hint="换个文件名，或加 --force 覆盖")
     work = _workdir()
     try:
-        data = _dump_to(work, base, size, device, speed)
+        data = _dump_to(work, base, size, device, speed, devices_xml)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -130,19 +153,27 @@ def _load_image(path: Path, base: int):
 
 
 def compare(path: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
-            device: str | None = None, speed: int = 4000) -> dict:
-    """把芯片 flash 与一个固件文件（HEX/SREC/BIN）逐字节比对。"""
+            device: str | None = None, speed: int = 4000,
+            devices_xml: str | None = None) -> dict:
+    """把芯片 flash 与一个固件文件（HEX/SREC/BIN）逐字节比对。
+
+    读回窗口自动放大到"文件跨度"：默认 32 KiB 会让 40 KiB 的镜像整段判成不同，
+    结论就假了。
+    """
     image = _load_image(path, base)
+    low, high = image.span
+    need = max(size, high - base)
     work = _workdir()
     try:
-        chip = _dump_to(work, base, size, device, speed)
+        chip = _dump_to(work, base, need, device, speed, devices_xml)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
-    same, diffs = 0, []
+    same, diffs, outside = 0, [], 0
     for segment in image.segments:
         offset = segment.addr - base
         if offset < 0 or offset + len(segment.data) > len(chip):
+            outside += len(segment.data)
             continue
         for index, value in enumerate(segment.data):
             if chip[offset + index] == value:
@@ -156,14 +187,19 @@ def compare(path: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
         "chip_size": len(chip),
         "same": same,
         "diff": total - same,
+        "outside_window": outside,
         "first_diffs": diffs,
         "chip_nonff": sum(1 for byte in chip if byte != 0xFF),
     }
 
 
 def flash(path: Path, device: str | None, base: int = DEFAULT_FLASH, speed: int = 4000,
-          verify: bool = True) -> dict:
-    """烧写固件，然后读回逐字节校验。device 必须给（J-Link 靠它选 flash 算法）。"""
+          verify: bool = True, devices_xml: str | None = None) -> dict:
+    """烧写固件，然后读回逐字节校验。
+
+    成功与否只看校验结果：J-Link 连上就会打印 O.K.，用"输出里有 O.K."判断烧写成功
+    会把失败当成功（实测踩过）。
+    """
     if not device:
         raise ReError(
             "烧写必须给 --device（J-Link 靠器件名选 flash 算法）",
@@ -179,13 +215,14 @@ def flash(path: Path, device: str | None, base: int = DEFAULT_FLASH, speed: int 
         else:
             shutil.copy2(path, work / "firmware.bin")
             load = f"loadbin firmware.bin, {base:#010x}"
-        text = _run(_head(device, speed) + ["erase", load], work, timeout=900)
-        if "O.K." not in text:
+        text = _run(_head(device, speed, devices_xml) + ["erase", load], work, timeout=900)
+        if "O.K." not in text.split("loadfile" if kind in ("ihex", "srec") else "loadbin")[-1]:
             tail = "\n".join(text.strip().splitlines()[-8:])
-            raise ReError("烧写失败（没看到 O.K.）", hint=tail[:400])
+            raise ReError("烧写没有回 O.K.", hint=tail[:400])
         result = {"wrote": str(path), "verify": "skipped"}
         if verify:
-            chip = _dump_to(work, base, max(DEFAULT_SIZE, image.total), device, speed)
+            need = max(DEFAULT_SIZE, image.span[1] - base)
+            chip = _dump_to(work, base, need, device, speed, devices_xml)
             bad = 0
             for segment in image.segments:
                 offset = segment.addr - base
@@ -193,7 +230,12 @@ def flash(path: Path, device: str | None, base: int = DEFAULT_FLASH, speed: int 
                     bad += len(segment.data)
                     continue
                 bad += sum(1 for i, v in enumerate(segment.data) if chip[offset + i] != v)
-            result["verify"] = "ok" if bad == 0 else f"{bad} 字节不一致"
+            if bad:
+                raise ReError(
+                    f"烧写后读回校验失败：{bad:,} 字节不一致",
+                    hint="芯片可能被写保护，或 flash 算法与器件不匹配（试试 --devices-xml）",
+                )
+            result["verify"] = "ok"
         return result
     finally:
         shutil.rmtree(work, ignore_errors=True)

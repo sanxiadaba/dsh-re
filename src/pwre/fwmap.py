@@ -165,8 +165,13 @@ def run(path: Path, out_dir: Path, base: int | None = None, partial: bool = Fals
     image, code, flat_base = load(path, base)
     if base is None:
         base = flat_base
+    # 先写临时目录，全部成功才搬进 out_dir：失败不留半成品
+    import shutil
+    import tempfile
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "image.bin").write_bytes(code)
+    work = Path(tempfile.mkdtemp(prefix="fwmap-", dir=str(out_dir.parent)))
+    (work / "image.bin").write_bytes(code)
 
     # 线性反汇编从第一个向量目标开始：向量表本身是数据，从 0 开始扫只会得到垃圾
     start_offset = 0
@@ -181,7 +186,7 @@ def run(path: Path, out_dir: Path, base: int | None = None, partial: bool = Fals
     lines = [f"# 0x{base:08x}–0x{base + start_offset:08x} 是向量表/头部，未按代码反汇编" if start_offset else "# 全量线性反汇编"]
     for item in insns:
         lines.append(f"{item['addr']:#010x}  {item['bytes']:<12}  {item['asm']}")
-    (out_dir / "full.asm").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (work / "full.asm").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # 函数边界：优先用向量表当种子，再用 rizin 深扫
     from . import disasm as disasm_mod
@@ -206,7 +211,10 @@ def run(path: Path, out_dir: Path, base: int | None = None, partial: bool = Fals
     result["size"] = len(code)
     result["errors"] = image.errors
     result["degraded"] = not funcs
-    (out_dir / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    (out_dir / "functions.json").write_text(json.dumps(funcs, indent=2, ensure_ascii=False), encoding="utf-8")
-    (out_dir / "function-map.md").write_text(function_map_md(result), encoding="utf-8")
+    (work / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (work / "functions.json").write_text(json.dumps(funcs, indent=2, ensure_ascii=False), encoding="utf-8")
+    (work / "function-map.md").write_text(function_map_md(result), encoding="utf-8")
+    for item in sorted(work.iterdir()):
+        shutil.move(str(item), str(out_dir / item.name))
+    shutil.rmtree(work, ignore_errors=True)
     return result

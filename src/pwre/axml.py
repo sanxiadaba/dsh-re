@@ -106,8 +106,12 @@ def parse(data: bytes) -> list[Element]:
             ns, name = struct.unpack_from("<II", data, offset + 16)
             attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, offset + 24)
             attrs = {}
+            if attr_size < 20:
+                raise ReError(f"属性长度 {attr_size} 不合理（{tag}）")
             for index in range(attr_count):
                 at = offset + 16 + attr_start + index * attr_size
+                if at + 20 > total:
+                    raise ReError(f"属性表越界（{tag}，第 {index} 个属性）")
                 _, aname, araw = struct.unpack_from("<III", data, at)
                 key = strings[aname] if aname < len(strings) else f"attr{aname}"
                 attrs[key] = _typed_value(data, at, strings)

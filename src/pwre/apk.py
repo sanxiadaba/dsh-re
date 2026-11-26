@@ -91,7 +91,8 @@ def _packer(names: set[str], manifest: dict, dex_sizes: list[int], total: int) -
         if lib in libs:
             return label
     factory = str(manifest.get("app_component_factory") or "")
-    if factory:
+    # 标准 AndroidX 工厂是正常配置，不是壳
+    if factory and "androidx.core.app.CoreComponentFactory" not in factory:
         return f"自定义壳（appComponentFactory={factory}）"
     if dex_sizes and max(dex_sizes) < 64 << 10 and total > 8 << 20:
         return f"疑似壳（classes.dex 只有 {human_size(max(dex_sizes))}，包却有 {human_size(total)}）"

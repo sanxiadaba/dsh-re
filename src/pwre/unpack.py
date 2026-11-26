@@ -87,14 +87,21 @@ def extract_zip(path: Path, dest: Path) -> list[dict]:
 
 def extract_tar(path: Path, dest: Path) -> list[dict]:
     out = []
-    with tarfile.open(path) as tf:
-        for member in tf.getmembers():
-            if not member.isfile():
-                continue
-            handle = tf.extractfile(member)
-            if handle is None:
-                continue
-            out.append(_write(dest, _safe_name(member.name), handle.read()))
+    total = 0
+    try:
+        with tarfile.open(path) as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                total += member.size
+                if total > MAX_UNPACK:
+                    raise ReError(f"解压后超过 {MAX_UNPACK >> 30} GiB，停下（可能的压缩炸弹）")
+                handle = tf.extractfile(member)
+                if handle is None:
+                    continue
+                out.append(_write(dest, _safe_name(member.name), handle.read()))
+    except (tarfile.ReadError, tarfile.CompressionError, EOFError) as exc:
+        raise ReError(f"tar 包读不下去：{exc}", hint="文件可能截断或不是 tar；换个来源重下")
     return out
 
 

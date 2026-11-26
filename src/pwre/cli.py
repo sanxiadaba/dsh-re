@@ -202,6 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", type=_number, default=0x08000000, help="flash 起始地址")
     p.add_argument("--size", type=_number, default=0x8000, help="读多少字节")
     p.add_argument("--speed", type=int, default=4000, help="SWD 速度 kHz")
+    p.add_argument("--devices-xml", default=None, help="额外的 J-Link 器件库（如 Keil 器件包里的 JLinkDevices.xml）")
+    p.add_argument("--force", action="store_true", help="--dump 的目标已存在也覆盖")
     p.set_defaults(func=cmd_chip)
 
     p = sub.add_parser("serial", help="串口：列端口、监听、环回自检、收发")
@@ -530,8 +532,8 @@ def cmd_mem(args):
 def cmd_proto(args):
     path = Path(args.path)
     data = path.read_bytes()
-    if not args.frame:
-        raise ReError("要给 --frame（帧长）", hint="先 re hex / re id 看清楚结构；按帧切开才能看字段")
+    if not args.frame or args.frame < 1:
+        raise ReError("要给正的 --frame（帧长）", hint="先 re hex / re id 看清楚结构；按帧切开才能看字段")
     frames = proto.split(data, args.frame)
     if not frames:
         raise ReError(f"文件只有 {len(data)} 字节，切不出 {args.frame} 字节的帧")
@@ -773,20 +775,24 @@ def cmd_chip(args):
                 "烧写会先擦除整个 flash，确认后才执行",
                 hint="确认目标无误后加 --yes；不确定就先 --compare",
             )
-        result = chip.flash(Path(args.path), args.device, args.base, args.speed)
+        result = chip.flash(Path(args.path), args.device, args.base, args.speed,
+                            devices_xml=args.devices_xml)
         lines = [f"烧写     {result['wrote']}", f"校验     {result['verify']}"]
         emit(args, lines, result)
         return 0
     if args.compare:
         if not args.path:
             raise ReError("--compare 要给固件文件")
-        data = chip.compare(Path(args.path), args.base, args.size, args.device, args.speed)
+        data = chip.compare(Path(args.path), args.base, args.size, args.device, args.speed,
+                            devices_xml=args.devices_xml)
         head = "完全相同" if data["diff"] == 0 else f"{data['diff']:,} 字节不同"
         lines = [
             f"文件     {data['file']}  {data['file_size']:,} 字节",
             f"芯片     {data['chip_size']:,} 字节（非 0xFF {data['chip_nonff']:,}）",
             f"结论     {head}",
         ]
+        if data.get("outside_window"):
+            lines.append(f"注意     {data['outside_window']:,} 字节落在读回窗口外（加大 --size）")
         for addr, want, got in data["first_diffs"][:6]:
             lines.append(f"  {addr:#010x}  文件 {want:#04x}  芯片 {got:#04x}")
         if len(data["first_diffs"]) >= 6:
@@ -794,11 +800,12 @@ def cmd_chip(args):
         emit(args, lines, data)
         return 0 if data["diff"] == 0 else 1
     if args.dump:
-        out = chip.dump(Path(args.dump), args.base, args.size, args.device, args.speed)
+        out = chip.dump(Path(args.dump), args.base, args.size, args.device, args.speed,
+                        force=args.force, devices_xml=args.devices_xml)
         emit(args, [f"读回     {out}（{out.stat().st_size:,} 字节，{args.base:#x} 起）"],
              {"path": str(out), "size": out.stat().st_size})
         return 0
-    info = chip.probe(args.device, args.speed)
+    info = chip.probe(args.device, args.speed, args.devices_xml)
     lines = [
         f"器件     {info['device']}",
         f"CPUID    {info['cpuid']:#010x}",

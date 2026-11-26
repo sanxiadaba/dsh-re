@@ -380,7 +380,7 @@ def _elf(path: Path, size: int, head: bytes) -> FileInfo:
         size,
         "elf",
         label,
-        arch=ELF_MACHINES.get(machine, f"machine {machine}"),
+        arch=ELF_MACHINES.get(machine) or (str(machine).replace("EM_", "").lower() if isinstance(machine, str) else f"machine {machine}"),
         bits=bits,
         endian=endian,
         entry=entry,
