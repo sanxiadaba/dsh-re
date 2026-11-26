@@ -6,18 +6,21 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, armvec, decompile, diff, disasm, engines, firmware, fwmap, mem, native, proto, unpack
-from .detect import FileInfo, entropy, packed_reasons, sniff
+from . import __version__, apk, armvec, chip, decompile, diff, disasm, engines, firmware, fwmap, mem, native, proto, scan, serialport, unpack
+from .detect import FileInfo, entropy, packer_name, packed_reasons, sniff
 from .errors import ReError
 from .out import emit, human_size, warn
 from .scan import interesting, scan_file
+
+KINDS = ("url", "path", "email", "ip", "format", "hex", "pem")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     # 全局开关放子命令后面也认：re id x --json 和 re --json id x 等价
     if "--json" in argv:
-        argv.remove("--json")
+        while "--json" in argv:
+            argv.remove("--json")
         argv.insert(0, "--json")
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -63,12 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path")
     p.add_argument("-n", "--min", type=int, default=4, help="最短长度（默认 4）")
     p.add_argument("-m", "--max", type=int, default=0, help="最长长度（0 表示不限）")
-    p.add_argument("-k", "--kind", action="append", default=None,
+    p.add_argument("-k", "--kind", action="append", default=None, choices=list(KINDS),
                    help="只留某类：url/path/email/ip/format/hex/pem，可重复")
     p.add_argument("-c", "--contains", default=None, help="只留包含该子串的")
     p.add_argument("-r", "--regex", default=None, help="只留匹配该正则的")
-    p.add_argument("-l", "--limit", type=int, default=0, help="最多输出条数（0 表示不限）")
-    p.add_argument("--no-utf16", action="store_true", help="不扫 UTF-16LE")
+    p.add_argument("-l", "--limit", type=int, default=200, help="最多输出条数（默认 200）")
+    p.add_argument("--all", action="store_true", help="不限条数（30MB 的包会刷屏）")
+    p.add_argument("-e", "--encoding", action="append", default=None, choices=list(scan.ENCODINGS),
+                   help="只扫某种编码：ascii/utf16/utf16be/gbk，可重复")
+    p.add_argument("--no-utf16", action="store_true", help="不扫 UTF-16")
     p.set_defaults(func=cmd_strings)
 
     p = sub.add_parser("hex", help="Intel HEX / S-record：段表、校验、转 BIN")
@@ -76,7 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址，如 0x08000000")
     p.add_argument("--to", choices=["bin"], default=None, help="转换目标格式")
     p.add_argument("--out", default=None, help="输出文件（--to bin 时必需）")
-    p.add_argument("--fill", type=_number, default=0xFF, help="空洞填充字节（默认 0xFF）")
+    p.add_argument("--fill", type=_byte, default=0xFF, help="空洞填充字节（默认 0xFF，0x00–0xFF）")
+    p.add_argument("--force", action="store_true", help="--out 已存在也覆盖")
     p.set_defaults(func=cmd_hex)
 
     p = sub.add_parser("fw", help="固件：向量表、入口、中断、代码区")
@@ -114,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deep", action="store_true", help="深度分析（aaaa，慢；PE 上可能几十秒）")
     p.add_argument("--base", type=_number, default=None, help="裸二进制的加载地址")
     p.add_argument("--force", action="store_true", help="文件疑似加壳也硬跑")
+    p.add_argument("--timeout", type=int, default=None, help="rizin 分析超时秒数")
     p.set_defaults(func=cmd_funcs)
 
     p = sub.add_parser("xref", help="谁引用了这个地址")
@@ -124,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deep", action="store_true", help="深度分析（aaaa，慢）")
     p.add_argument("--base", type=_number, default=None, help="裸二进制的加载地址")
     p.add_argument("--force", action="store_true", help="文件疑似加壳也硬跑")
+    p.add_argument("--timeout", type=int, default=None, help="rizin 分析超时秒数")
     p.set_defaults(func=cmd_xref)
 
     p = sub.add_parser("diff", help="两版对比：字节差异 + 结构差异")
@@ -147,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--addr", type=_number, default=None, help="起始地址")
     p.add_argument("--size", type=_number, default=None, help="长度（字节）")
     p.add_argument("-o", "--out", default=None, help="dump 输出文件")
+    p.add_argument("--force", action="store_true", help="目标文件已存在也覆盖")
     p.set_defaults(func=cmd_mem)
 
     p = sub.add_parser("proto", help="报文：按帧切分，找恒定位与变化位")
@@ -165,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("fwmap", help="固件结构：全量反汇编 + 函数地图 + 外设引用")
     p.add_argument("path")
     p.add_argument("-o", "--out", default=None, help="输出目录（默认 <文件名>.fwmap）")
+    p.add_argument("--force", action="store_true", help="输出目录非空也写")
+    p.add_argument("--partial", action="store_true", help="没有 rizin 时只出线性反汇编（不推荐）")
     p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址")
     p.set_defaults(func=cmd_fwmap)
 
@@ -174,14 +186,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="目标目录非空也照剥")
     p.set_defaults(func=cmd_unpack)
 
+    p = sub.add_parser("apk", help="APK 结构：包名、版本、框架、壳、原生库、SDK 线索")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_apk)
+
+    p = sub.add_parser("chip", help="真硬件：J-Link/SWD 探测、读回、比对、烧写")
+    p.add_argument("path", nargs="?", default=None, help="固件文件（--compare/--flash 时给）")
+    p.add_argument("--info", action="store_true", help="连上芯片读 CPUID 与向量表")
+    p.add_argument("--dump", default=None, help="把 flash 读回这个文件")
+    p.add_argument("--compare", action="store_true", help="芯片 flash 与 path 逐字节比对")
+    p.add_argument("--flash", action="store_true", help="把 path 烧进芯片（要配 --yes）")
+    p.add_argument("--yes", action="store_true", help="确认烧写（会擦除整个 flash）")
+    p.add_argument("--device", default=None, help="J-Link 器件名，例如 PY32F030")
+    p.add_argument("--base", type=_number, default=0x08000000, help="flash 起始地址")
+    p.add_argument("--size", type=_number, default=0x8000, help="读多少字节")
+    p.add_argument("--speed", type=int, default=4000, help="SWD 速度 kHz")
+    p.set_defaults(func=cmd_chip)
+
+    p = sub.add_parser("serial", help="串口：列端口、监听、环回自检、收发")
+    p.add_argument("-p", "--port", default=None, help="串口名，例如 COM11")
+    p.add_argument("-b", "--baud", type=int, default=115200, help="波特率")
+    p.add_argument("--list", action="store_true", help="列出本机串口")
+    p.add_argument("--listen", type=float, default=0.0, help="监听多少秒")
+    p.add_argument("--loopback", action="store_true", help="发探针并校验回显（验证短接/接线）")
+    p.add_argument("--send", default=None, help="发送 text:内容 或 hex:01 02 03")
+    p.add_argument("--wait", type=float, default=1.0, help="发送后等多久收（秒）")
+    p.set_defaults(func=cmd_serial)
+
     p = sub.add_parser("setup", help="下载并安装引擎")
     p.add_argument("--rizin", action="store_true", help="反汇编引擎（re dis/funcs/xref 必需）")
     p.add_argument("--ghidra", action="store_true", help="反编译器（re decompile 必需，会自动带 JDK）")
-    p.add_argument("--java", action="store_true", help="只装 JDK 21")
-    p.add_argument("--all", action="store_true", help="装齐 rizin + ghidra + JDK")
+    p.add_argument("--java", action="store_true", help="装 JDK（版本按 Ghidra 要求，当前 25）")
+    p.add_argument("--all", action="store_true", help="装齐 java + rizin + ghidra")
     p.set_defaults(func=cmd_setup)
 
     return parser
+
+
+def _byte(value: str) -> int:
+    number = _number(value)
+    if not 0 <= number <= 0xFF:
+        raise argparse.ArgumentTypeError(f"必须是 0x00–0xFF，收到 {value}")
+    return number
 
 
 def _number(value: str) -> int:
@@ -201,15 +247,17 @@ def _timestamp(value: int) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _pe_deps(info: FileInfo) -> tuple[list[str], int]:
+def _pe_deps(info: FileInfo) -> tuple[list[str], int, dict]:
     import pefile
+
+    from .native import version_info
 
     pe = pefile.PE(str(info.path))
     dlls, count = [], 0
     for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
         dlls.append(entry.dll.decode("latin-1", "replace"))
         count += len(entry.imports or [])
-    return dlls, count
+    return dlls, count, version_info(pe)
 
 
 def _entropy_note(value: float) -> str:
@@ -257,12 +305,22 @@ def cmd_id(args):
         lines.append(f"节       {len(names)} 个：{' '.join(names)}")
         reasons = packed_reasons(info)
         if reasons:
-            lines.append("壳       疑似加壳/保护：" + "，".join(reasons))
+            name = packer_name(info)
+            prefix = f"{name} 壳：" if name else "疑似加壳/保护："
+            lines.append("壳       " + prefix + "，".join(reasons))
+            if name:
+                lines.append("下一步   re unpack（UPX 这类壳会直接脱掉）")
         try:
-            dlls, count = _pe_deps(info)
+            dlls, count, version = _pe_deps(info)
         except Exception as exc:
             warn(f"导入表读不出来：{exc}")
-            dlls, count = [], 0
+            dlls, count, version = [], 0, {}
+        if version:
+            keys = ("ProductName", "FileDescription", "FileVersion", "CompanyName")
+            brief = "  ".join(f"{key}={version[key]}" for key in keys if version.get(key))
+            if brief:
+                lines.append(f"版本信息 {brief}")
+            payload["version_info"] = version
         if dlls:
             lines.append(f"导入     {count} 个函数 / {len(dlls)} 个 DLL")
             lines.append(f"依赖     {', '.join(dlls[:8])}{' …' if len(dlls) > 8 else ''}")
@@ -276,8 +334,9 @@ def cmd_id(args):
         payload["sections"] = extra["sections"]
     elif info.kind in ("asar", "apk", "jar", "zip", "docx", "xlsx", "pptx", "ooxml"):
         entries = info.extra.get("entries") or []
-        if entries:
-            lines.append(f"条目     {len(entries)} 个")
+        count = entries if isinstance(entries, int) else len(entries)
+        if count:
+            lines.append(f"条目     {count} 个")
     elif info.kind == "unknown":
         lines.append(f"magic    {path.read_bytes()[:8].hex(' ')}")
         lines.append(f"熵       {head:.2f}{_entropy_note(head)}")
@@ -300,7 +359,10 @@ def cmd_strings(args):
     path = Path(args.path)
     if not path.is_file():
         raise ReError(f"不是文件：{path}")
-    rows = scan_file(path, min_len=args.min, utf16=not args.no_utf16)
+    encodings = tuple(args.encoding) if args.encoding else scan.ENCODINGS
+    if args.no_utf16:
+        encodings = tuple(name for name in encodings if not name.startswith("utf16"))
+    rows = scan.scan_file(path, min_len=args.min, encodings=encodings)
     kinds = set(args.kind or [])
     regex = None
     if args.regex:
@@ -310,6 +372,7 @@ def cmd_strings(args):
             regex = re.compile(args.regex)
         except re.error as exc:
             raise ReError(f"正则写错了：{exc}")
+    limit = 0 if args.all else max(0, args.limit)
     out = []
     for offset, encoding, text in rows:
         if args.max and len(text) > args.max:
@@ -323,11 +386,13 @@ def cmd_strings(args):
             if kind not in kinds:
                 continue
         out.append((offset, encoding, text))
-        if args.limit and len(out) >= args.limit:
+        if limit and len(out) >= limit:
             break
-    lines = [f"{offset:#010x}  {encoding:<5}  {text}" for offset, encoding, text in out]
+    lines = [f"{offset:#010x}  {encoding:<7}  {text}" for offset, encoding, text in out]
     if not lines:
-        lines = ["（没有匹配的字符串）"]
+        lines = [f"（没有匹配的字符串；本次扫了 {'/'.join(encodings)}，共找到 0 条）"]
+    elif limit and len(rows) > len(out):
+        lines.append(f"… 只显示前 {len(out)} 条（加 --all 看全部）")
     payload = [{"offset": o, "encoding": e, "text": t} for o, e, t in out]
     emit(args, lines, payload)
     return 0
@@ -368,7 +433,7 @@ def cmd_dis(args):
 
 def cmd_funcs(args):
     path = Path(args.path)
-    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None))
+    rows, total = disasm.functions(path, limit=10_000, arch=args.arch, bits=args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None), timeout=getattr(args, "timeout", None))
     rows.sort(key=lambda row: row.get("size", 0) or 0, reverse=True)
     rows = rows[: args.limit]
     lines = [f"函数     {total} 个" + (f"，按大小列前 {len(rows)}" if total > len(rows) else "")]
@@ -384,7 +449,7 @@ def cmd_funcs(args):
 
 def cmd_xref(args):
     path = Path(args.path)
-    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None))
+    rows = disasm.xrefs(path, args.at, args.arch, args.bits, deep=args.deep, force=args.force, base=getattr(args, "base", None), timeout=getattr(args, "timeout", None))
     lines = [f"引用     0x{args.at:x} 的位置共 {len(rows)} 处"]
     for row in rows:
         lines.append(f"  {row.get('from', 0):#010x}  {row.get('type', ''):<8} {row.get('opcode', '')}")
@@ -409,13 +474,13 @@ def cmd_decompile(args):
 
 def cmd_mem(args):
     if args.list:
-        rows = mem.list_processes(args.filter)
-        lines = [f"进程     {len(rows)} 个"]
+        rows, skipped = mem.list_processes(args.filter)
+        lines = [f"进程     {len(rows)} 个" + (f"（另有 {skipped} 个打不开，权限不足）" if skipped else "")]
         for row in rows[:60]:
             lines.append(f"  {row['pid']:>6}  {row['name']}")
         if len(rows) > 60:
             lines.append(f"  … 还有 {len(rows) - 60} 个")
-        emit(args, lines, {"processes": rows})
+        emit(args, lines, {"processes": rows, "skipped": skipped})
         return 0
     if args.pid is None:
         raise ReError("要给 --pid（或用 --list 先看进程）")
@@ -433,14 +498,19 @@ def cmd_mem(args):
     if not 0 < args.size <= 64 << 20:
         raise ReError(f"--size 要在 1 到 64 MiB 之间，收到 {args.size}")
     if args.out:
-        count = mem.dump(args.pid, args.addr, args.size, Path(args.out))
+        target = Path(args.out)
+        if target.exists() and not args.force:
+            raise ReError(f"目标已存在：{target}", hint="换个文件名，或加 --force 覆盖")
+        count = mem.dump(args.pid, args.addr, args.size, target)
         emit(args, [f"写出     {args.out}（{count:,} 字节，pid {args.pid}，{args.addr:#x}）"],
              {"path": args.out, "size": count})
         return 0
     data = mem.read(args.pid, args.addr, args.size)
     lines = [f"内存     pid {args.pid}  {args.addr:#x}  {len(data):,} 字节"]
-    lines += proto.hexdump(data, limit=max(1, args.size // 16))
-    emit(args, lines, {"pid": args.pid, "addr": args.addr, "hex": data.hex()})
+    lines += proto.hexdump(data, limit=32)
+    if len(data) > 32 * 16:
+        lines.append(f"  … 共 {len(data):,} 字节，要全量用 -o 落盘")
+    emit(args, lines, {"pid": args.pid, "addr": args.addr, "size": len(data)})
     return 0
 
 
@@ -464,6 +534,9 @@ def cmd_proto(args):
         head = "".join(f"{byte:02x} " for byte in data[: min(len(data), args.frame)])
         lines.append(f"首帧     {head.strip()}")
     lines.append("变化     " + "，".join(f"[{start:#x},{end:#x})" for start, end in varying) if varying else "变化     无")
+    rest = len(data) % args.frame
+    if rest:
+        lines.append(f"尾部     {rest} 字节不足一帧，已忽略（换 --frame，或协议带同步字）")
     for frame in frames[: args.max]:
         lines.append("帧 " + frame.hex(" "))
     emit(args, lines, {
@@ -487,11 +560,13 @@ def cmd_decompile_all(args):
 def cmd_fwmap(args):
     path = Path(args.path)
     out = Path(args.out) if args.out else path.with_name(path.stem + ".fwmap")
-    result = fwmap.run(path, out, args.base)
+    if out.exists() and any(out.iterdir()) and not args.force:
+        raise ReError(f"输出目录非空：{out}", hint="换个 -o，或加 --force 覆盖")
+    result = fwmap.run(path, out, args.base, partial=args.partial)
     top = sorted(result["peripherals"], key=lambda p: -p["count"])[:5]
     lines = [
         f"输出     {out}",
-        f"函数     {len(result['functions'])} 个",
+        f"函数     {len(result['functions'])} 个" + ("（线性模式：没有函数表）" if result.get("degraded") else ""),
         f"外设     {len(result['peripherals'])} 个地址",
         f"映像     {result['size']:,} 字节，基址 {result['base']:#010x}",
     ]
@@ -517,6 +592,19 @@ def cmd_unpack(args):
     notes = [item["note"] for item in items if "note" in item]
     lines.extend(f"备注     {note}" for note in notes)
     emit(args, lines, {"format": kind, "dest": str(dest), "files": files, "notes": notes})
+    return 0
+
+
+def cmd_apk(args):
+    path = Path(args.path)
+    info = sniff(path)
+    if info.kind != "apk":
+        raise ReError(
+            f"{path.name} 不是 APK（识别为 {info.label}）",
+            hint="APK 长这样：顶层有 AndroidManifest.xml 的 zip；jar 用 re unpack",
+        )
+    lines, payload = apk.report(path)
+    emit(args, lines, payload)
     return 0
 
 
@@ -565,8 +653,18 @@ def cmd_hex(args):
     if args.to == "bin":
         if not args.out:
             raise ReError("--to bin 要配 --out", hint="例如 --to bin --out firmware.bin")
+        if image.errors:
+            raise ReError(
+                f"映像有 {len(image.errors)} 处错误，拒绝转 BIN（先 re hex 看清楚）",
+                hint="先用 re hex 看错误行；确认只是校验和错可以修好文件再转",
+            )
+        if not image.total:
+            raise ReError("映像里没有数据，转 BIN 没有意义")
+        target = Path(args.out)
+        if target.exists() and not args.force:
+            raise ReError(f"目标已存在：{target}", hint="换个文件名，或加 --force 覆盖")
         base, flat = image.to_flat(args.fill)
-        Path(args.out).write_bytes(flat)
+        target.write_bytes(flat)
         lines.append(f"输出     {args.out}（{len(flat):,} 字节，基址 {base:#010x}，填充 {args.fill:#04x}）")
         payload["out"] = {"path": args.out, "base": base, "size": len(flat)}
     emit(args, lines, payload)
@@ -595,12 +693,19 @@ def cmd_fw(args):
         items = "  ".join(f"{item['name']} {item['addr']:#010x}" for item in data["exceptions"])
         lines.append(f"异常     {items}")
     irqs = data["irqs"]
+    common = data["common_handler"]
     if irqs:
-        lines.append(f"中断     {len(irqs)} 个：IRQ{irqs[0]['index']} {irqs[0]['addr']:#010x}"
-                     + (f" … IRQ{irqs[-1]['index']} {irqs[-1]['addr']:#010x}" if len(irqs) > 1 else ""))
+        line = f"中断     {len(irqs)} 个 Thumb 目标"
+        if common["count"] > 1:
+            line += f"（其中 {common['count']} 个都指向 {common['addr']:#010x}，通常是默认处理）"
+        lines.append(line)
+        nz = [item for item in irqs if item["addr"] != common["addr"]]
+        if nz:
+            shown = "  ".join(f"IRQ{item['index']} {item['addr']:#010x}" for item in nz[:6])
+            lines.append(f"独立处理 {shown}" + (f" … 还有 {len(nz) - 6} 个" if len(nz) > 6 else ""))
     else:
-        lines.append("中断     全 0（没有注册中断）")
-    lines.append(f"代码区   {code_low:#010x} – {code_high + 1:#010x}（{code_high + 1 - code_low:,} 字节）")
+        lines.append(f"中断     没有 Thumb 向量（表里 {data['reserved']} 个槽保留或指向映像外）")
+    lines.append(f"向量目标 {code_low:#010x} – {code_high + 1:#010x}（{code_high + 1 - code_low:,} 字节，不是代码总量）")
     if image.errors:
         lines.append(f"错误     {len(image.errors)} 处（先跑 re hex 看清楚）")
     if args.vectors:
@@ -626,9 +731,15 @@ def cmd_doctor(args):
     for row in engines.status():
         mark = "OK  " if row["ok"] else "缺失"
         path = row["path"] or row["purpose"]
-        lines.append(f"  {mark} {row['name']:<8} {path}")
+        suffix = f"  {row['note']}" if row.get("note") else ""
+        lines.append(f"  {mark} {row['name']:<8} {path}{suffix}")
         payload["engines"].append(row)
     missing = [row["name"] for row in payload["engines"] if not row["ok"]]
+    lines.append("可选工具")
+    for row in engines.optional_status():
+        mark = "OK  " if row["path"] else "缺失"
+        lines.append(f"  {mark} {row['name']:<8} {row['path'] or row['purpose']}")
+        payload.setdefault("tools", []).append(row)
     lines.append(f"数据目录 {engines.data_dir()}")
     if missing:
         lines.append("")
@@ -638,10 +749,88 @@ def cmd_doctor(args):
     return 1 if missing else 0
 
 
+def cmd_chip(args):
+    if args.flash:
+        if not args.path:
+            raise ReError("--flash 要给固件文件")
+        if not args.yes:
+            raise ReError(
+                "烧写会先擦除整个 flash，确认后才执行",
+                hint="确认目标无误后加 --yes；不确定就先 --compare",
+            )
+        result = chip.flash(Path(args.path), args.device, args.base, args.speed)
+        lines = [f"烧写     {result['wrote']}", f"校验     {result['verify']}"]
+        emit(args, lines, result)
+        return 0
+    if args.compare:
+        if not args.path:
+            raise ReError("--compare 要给固件文件")
+        data = chip.compare(Path(args.path), args.base, args.size, args.device, args.speed)
+        head = "完全相同" if data["diff"] == 0 else f"{data['diff']:,} 字节不同"
+        lines = [
+            f"文件     {data['file']}  {data['file_size']:,} 字节",
+            f"芯片     {data['chip_size']:,} 字节（非 0xFF {data['chip_nonff']:,}）",
+            f"结论     {head}",
+        ]
+        for addr, want, got in data["first_diffs"][:6]:
+            lines.append(f"  {addr:#010x}  文件 {want:#04x}  芯片 {got:#04x}")
+        if len(data["first_diffs"]) >= 6:
+            lines.append("  … 只列前 6 处")
+        emit(args, lines, data)
+        return 0 if data["diff"] == 0 else 1
+    if args.dump:
+        out = chip.dump(Path(args.dump), args.base, args.size, args.device, args.speed)
+        emit(args, [f"读回     {out}（{out.stat().st_size:,} 字节，{args.base:#x} 起）"],
+             {"path": str(out), "size": out.stat().st_size})
+        return 0
+    info = chip.probe(args.device, args.speed)
+    lines = [
+        f"器件     {info['device']}",
+        f"CPUID    {info['cpuid']:#010x}",
+        f"向量表   SP {info['sp']:#010x}   Reset {info['target']:#010x}"
+        + ("（Thumb）" if info["thumb"] else "（没有 Thumb 位，可能不是 Cortex-M）"),
+    ]
+    emit(args, lines, info)
+    return 0
+
+
+def cmd_serial(args):
+    if args.list:
+        rows = serialport.ports()
+        lines = [f"串口     {len(rows)} 个"]
+        for row in rows:
+            lines.append(f"  {row['device']:<10} {row['description']}")
+        emit(args, lines, {"ports": rows})
+        return 0
+    if not args.port:
+        raise ReError("要给 -p COMx（或 --list 看有哪些）")
+    if args.loopback:
+        data = serialport.loopback(args.port, args.baud)
+        head = "回显一致" if data["echo"] else "回显不一致"
+        lines = [f"端口     {data['port']} @ {data['baud']}", f"结论     {head}",
+                 f"发出     {data['sent']!r}", f"收回     {data['received'][:64]!r}"]
+        emit(args, lines, {"port": data["port"], "echo": data["echo"], "size": len(data["received"])})
+        return 0 if data["echo"] else 1
+    if args.send:
+        data = serialport.exchange(args.port, args.baud, args.send, args.wait)
+        lines = [f"发出     {data['sent']!r}", f"收回     {data['size']} 字节"]
+        lines += serialport.hexdump(data["received"])
+        if not data["size"]:
+            lines.append("（没有收到任何字节）")
+        emit(args, lines, {"sent": data["sent"].hex(), "received": data["received"].hex()})
+        return 0
+    seconds = args.listen or 2.0
+    data = serialport.listen(args.port, args.baud, seconds)
+    lines = [f"端口     {args.port} @ {args.baud}，监听 {seconds:g}s", f"收到     {len(data)} 字节"]
+    lines += serialport.hexdump(data)
+    emit(args, lines, {"port": args.port, "size": len(data), "hex": data.hex()})
+    return 0
+
+
 def cmd_setup(args):
     names = []
     if args.all:
-        names = ["rizin", "ghidra"]
+        names = ["java", "rizin", "ghidra"]
     else:
         for name in ("rizin", "ghidra", "java"):
             if getattr(args, name):

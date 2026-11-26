@@ -5,6 +5,7 @@ import hashlib
 import json
 import lzma
 import bz2
+import re
 import os
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-from .detect import sniff
+from .detect import packer_name, sniff
 from .errors import ReError
 
 
@@ -27,7 +28,7 @@ def _write(dest: Path, name: str, data: bytes) -> dict:
 
 
 def _safe_name(name: str) -> str:
-    """只接受包内的相对路径；盘符、绝对路径、.. 一律拒绝。"""
+    """只接受包内的相对路径；盘符、绝对路径、..、Windows 设备名一律拒绝。"""
     raw = name.replace("\\", "/")
     if raw.startswith("/") or (len(raw) >= 2 and raw[1] == ":"):
         raise ReError(f"包里有绝对路径/盘符，拒绝解压：{name}")
@@ -37,6 +38,15 @@ def _safe_name(name: str) -> str:
             continue
         if part == "..":
             raise ReError(f"包里有 .. 路径，拒绝解压：{name}")
+        if ":" in part:
+            raise ReError(f"包里有备用数据流/驱动器语法，拒绝解压：{name}")
+        if part.rstrip(" .") != part:
+            raise ReError(f"包里有尾部点/空格的路径，Windows 会写到别处，拒绝：{name}")
+        if any(ch in part for ch in '<>"|?*'):
+            raise ReError(f"包里有 Windows 非法字符，拒绝解压：{name}")
+        stem = part.split(".", 1)[0].upper()
+        if stem in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(COM|LPT)[0-9]", stem):
+            raise ReError(f"包里有 Windows 设备名，拒绝解压：{name}")
         parts.append(part)
     if not parts:
         raise ReError(f"包里有不安全的路径：{name}")
@@ -45,11 +55,16 @@ def _safe_name(name: str) -> str:
 
 def extract_zip(path: Path, dest: Path) -> list[dict]:
     out = []
-    with zipfile.ZipFile(path) as zf:
-        for entry in zf.infolist():
-            if entry.is_dir():
-                continue
-            out.append(_write(dest, _safe_name(entry.filename), zf.read(entry)))
+    try:
+        with zipfile.ZipFile(path) as zf:
+            for entry in zf.infolist():
+                if entry.is_dir():
+                    continue
+                out.append(_write(dest, _safe_name(entry.filename), zf.read(entry)))
+    except RuntimeError as exc:
+        raise ReError(f"这个包解不开：{exc}", hint="加密包要先解密；不是标准 zip 就用 7z")
+    except (zipfile.BadZipFile, NotImplementedError) as exc:
+        raise ReError(f"这个包坏了或不支持：{exc}", hint="CRC 错说明文件损坏；换个来源重下")
     return out
 
 
@@ -83,21 +98,45 @@ def extract_zstd(path: Path, dest: Path) -> list[dict]:
     return _decompress(path, dest, lambda p: zstandard.ZstdDecompressor().stream_reader(open(p, "rb")))
 
 
-def extract_asar(path: Path, dest: Path) -> list[dict]:
-    raw = path.read_bytes()
-    if len(raw) < 8:
-        raise ReError("asar 文件太短")
+def asar_header(raw: bytes) -> tuple[dict, int]:
+    """解析 asar 头，返回 (JSON 头, 数据起点)。
+
+    真实 asar 是 Chromium pickle 的双层结构：
+      u32=4 | u32=第二层总长B | u32=B-4 | u32=JSON 长度D | JSON(16..16+D, 4 对齐) | 数据
+    数据起点 = 8 + B。早期实现的单层写法（u32 总长 | u32 JSON 长 | JSON@8）也接受。
+    """
     import struct
 
-    total = struct.unpack("<I", raw[:4])[0]
-    json_len = struct.unpack("<I", raw[4:8])[0]
-    if json_len + 8 > total or total > len(raw):
-        raise ReError("asar 头部长度自相矛盾，文件可能截断")
+    if len(raw) < 16:
+        raise ReError("asar 文件太短")
+    first, second, third, fourth = struct.unpack("<IIII", raw[:16])
+    if raw[8:9] == b"{" or first == second + 8:
+        # 单层：total | json_len | json
+        json_len = second
+        data_start = 8 + json_len
+        blob = raw[8: 8 + json_len]
+        if json_len + 8 > len(raw):
+            raise ReError("asar 头部长度自相矛盾，文件可能截断")
+    else:
+        if first != 4 or second == 0 or second > len(raw) - 8:
+            raise ReError(f"asar 头部布局不认识（前四个 u32：{first} {second} {third} {fourth}）")
+        json_len = fourth
+        if json_len > second or second + 8 > len(raw):
+            raise ReError("asar 头部长度自相矛盾，文件可能截断")
+        data_start = 8 + second
+        blob = raw[16: 16 + json_len]
     try:
-        header = json.loads(raw[8: 8 + json_len].rstrip(b"\x00").decode("utf-8"))
+        header = json.loads(blob.rstrip(b"\x00").decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ReError(f"asar 头部 JSON 解析失败：{exc}")
-    data_start = 8 + json_len
+    if not isinstance(header, dict) or "files" not in header:
+        raise ReError("asar 头部里没有 files 树")
+    return header, data_start
+
+
+def extract_asar(path: Path, dest: Path) -> list[dict]:
+    raw = path.read_bytes()
+    header, data_start = asar_header(raw)
 
     out = []
 
@@ -118,6 +157,8 @@ def extract_asar(path: Path, dest: Path) -> list[dict]:
                 continue
             offset = int(item.get("offset", 0))
             size = int(item.get("size", 0))
+            if offset < 0 or size < 0 or data_start + offset + size > len(raw):
+                raise ReError(f"asar 条目越界：{rel}")
             chunk = raw[data_start + offset: data_start + offset + size]
             if len(chunk) != size:
                 raise ReError(f"asar 条目越界：{rel}")
@@ -221,6 +262,27 @@ def extract_pyinstaller(path: Path, dest: Path) -> list[dict]:
     return out
 
 
+def extract_upx(path: Path, dest: Path) -> list[dict]:
+    """UPX 脱壳：调 upx.exe 把它自己解开。"""
+    from . import engines
+
+    exe = engines.upx_path()
+    if not exe:
+        raise ReError(
+            f"{path.name} 是 UPX 壳，但没有 upx.exe",
+            hint="把 upx.exe 放到 %LOCALAPPDATA%\\dsh-re\\tools\\upx\\ 或装进 PATH；或用 re mem 从内存 dump",
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / f"{path.stem}.unpacked{path.suffix.lower()}"
+    result = engines.run([exe, "-d", str(path), "-o", str(target)], timeout=300)
+    if result.returncode != 0 or not target.is_file():
+        raise ReError(
+            f"upx 脱壳失败（退出码 {result.returncode}）：{(result.stderr or result.stdout).strip()[:200]}",
+            hint="可能不是标准 UPX，或已被改壳；试试 re mem 从内存 dump",
+        )
+    return [{"path": str(target), "size": target.stat().st_size}]
+
+
 def _collect(dest: Path) -> list[dict]:
     return [
         {"path": str(item), "size": item.stat().st_size}
@@ -230,10 +292,44 @@ def _collect(dest: Path) -> list[dict]:
 
 
 def unpack(path: Path, dest: Path, force: bool = False) -> tuple[list[dict], str]:
-    """返回 (提取结果, 用到的格式名)。"""
+    """返回 (提取结果, 用到的格式名)。
+
+    先解到 `<dest>.re-tmp`，全部成功才搬进 dest：坏包/路径逃逸不会在目标目录里
+    留下半成品（SKILL 承诺"不返回半成品"，这里兑现）。
+    """
+    if dest.exists() and not dest.is_dir():
+        raise ReError(f"-o 指的是文件而不是目录：{dest}")
     if dest.exists() and any(dest.iterdir()) and not force:
         raise ReError(f"目标目录非空：{dest}", hint="换个 -o，或加 --force 覆盖")
-    dest.mkdir(parents=True, exist_ok=True)
+    work = dest.with_name(dest.name + ".re-tmp")
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        items, kind = _dispatch(path, work)
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in sorted(work.rglob("*")):
+            target = dest / item.relative_to(work)
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(target))
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    moved = []
+    for item in items:
+        if "path" not in item:
+            moved.append(item)
+            continue
+        rel = Path(item["path"]).relative_to(work)
+        moved.append({"path": str(dest / rel), "size": item["size"]})
+    shutil.rmtree(work, ignore_errors=True)
+    return moved, kind
+
+
+def _dispatch(path: Path, dest: Path) -> tuple[list[dict], str]:
     info = sniff(path)
     kind = info.kind
     if kind in ("zip", "apk", "jar", "docx", "xlsx", "pptx", "ooxml"):
@@ -258,6 +354,8 @@ def unpack(path: Path, dest: Path, force: bool = False) -> tuple[list[dict], str
         return extract_7z(path, dest), kind
     if kind in ("pe", "dll") and b"MEI\x0c\x0b\x0a\x0b\x0e" in path.read_bytes()[-2 << 20:]:
         return extract_pyinstaller(path, dest), "pyinstaller"
+    if kind in ("pe", "dll") and packer_name(info) == "UPX":
+        return extract_upx(path, dest), "upx"
     raise ReError(
         f"{path.name} 识别为 {info.label}，不是可剥的包",
         hint="先用 re id 看清楚；固件用 re fw / re hex",

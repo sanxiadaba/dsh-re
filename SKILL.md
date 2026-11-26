@@ -37,11 +37,12 @@ re setup --ghidra    # 反编译（自动带 JDK）
 
 | 你手上是 | 下一步 |
 |---|---|
-| 固件（.hex/.srec/.bin） | `re hex` 看段 → `re fw` 看向量表/入口 → `re funcs` → `re dis --at` → `re decompile --at` |
+| 固件（.hex/.srec/.bin） | `re hex` 看段 → `re fw` 看向量表/入口 → `re funcs` → `re dis --at` → `re decompile --at`；要确认芯片里是不是这一版就 `re chip --compare` |
 | PE / ELF / DLL | `re pe` / `re elf` → `re strings` → `re funcs` → `re xref --at` → `re decompile --at` |
-| 安装包、asar、zip、APK、MSI、CAB | `re unpack` 摊开，再回到第 1 步 |
+| 安装包、asar、zip、APK、MSI、CAB | `re unpack` 摊开；APK 先 `re apk` 看包名/框架/壳/SDK 线索，再回到第 1 步 |
 | 两个版本 | `re diff A B`，先看字节差异段，再看导入/节差异 |
 | 一堆报文 / 内存 / 进程 | `re proto`（离线分帧看字段）、`re mem`（进程/模块/内存 dump，Windows） |
+| 真硬件 | `re chip --info` 探测、`--compare` 比对、`--dump` 读回、`--flash --yes` 烧写；`re serial --loopback` 验串口接线 |
 
 3. **给结论**：每条都要能落到地址、偏移或文件条目上。拿不准就写"推断"，别编。
 
@@ -61,7 +62,10 @@ re setup --ghidra    # 反编译（自动带 JDK）
 | `re decompile 文件 --at 0x...` | 反编译一个函数（Ghidra，首次较慢） |
 | `re decompile-all 文件 -o all.c` | 所有函数反编译到一个文件 |
 | `re diff A B` | 两版差在哪 |
-| `re unpack 文件 [-o 目录]` | 剥包：zip/apk/jar/asar/tar/gz/xz/zst/cab/msi/pyinstaller |
+| `re unpack 文件 [-o 目录]` | 剥包：zip/apk/jar/asar/tar/gz/xz/zst/cab/msi/pyinstaller、**UPX 壳的 PE** |
+| `re apk 文件` | APK 结构：包名/版本/权限/框架(Flutter/RN/Unity)/加固特征/原生库/SDK 线索 |
+| `re chip` | J-Link + SWD：`--info` 探测、`--dump` 读回、`--compare` 与固件比对、`--flash --yes` 烧写 |
+| `re serial` | 串口：`--list`、`--listen N`、`--loopback` 环回自检、`--send text:…/hex:…` |
 | `re mem` | 列进程、列模块、按地址 dump（Windows） |
 | `re proto` | 把抓包按帧切分，指出恒定位与变化位 |
 | `re doctor` / `re setup` | 体检与装引擎 |
@@ -73,9 +77,11 @@ re setup --ghidra    # 反编译（自动带 JDK）
 
 ## 硬规则
 
-- **不降级**：`re dis` 没有 rizin 会直接失败并给安装命令，不会拿玩具凑数。
+- **不降级**：`re dis`/`re funcs`/`re fwmap` 没有 rizin 会直接失败并给安装命令，不会拿玩具凑数
+  （`re fwmap --partial` 是显式的、结果里标 `degraded: true` 的例外）。
 - **不猜**：认不出架构、找不到向量表、哈希不符，都会明确报错，不返回半成品。
-- **不硬来**：加壳文件跑 `re funcs` 会被拒绝（静态分析只会得到垃圾），先 `re unpack` 或从内存 dump。
+- **不硬来**：加壳文件跑 `re funcs` 会被拒绝；`re id` 会说出是哪种壳（UPX/ASPack/VMProtect…），
+  UPX 直接 `re unpack` 就能脱，其它壳从内存 dump（`re mem`）。
 - **不特例**：不认识项目名、不认识芯片型号；一切从文件内容推。
 
 细节参数见 `references/commands.md`，场景配方见 `references/recipes.md`。

@@ -89,11 +89,24 @@ def entropy(data: bytes) -> float:
 
 
 def looks_text(data: bytes) -> bool:
+    """粗判文本：ASCII 可打印比例要高，且高位字节得能按 UTF-8 解出来。
+
+    以前把 b>=0x80 全算可打印，0xFF 填满的二进制会被当成文本，`re dis` 就再也
+    不肯反汇编它了。
+    """
     sample = data[:4096]
     if not sample:
         return False
-    printable = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126 or b >= 0x80)
-    return printable / len(sample) > 0.95
+    ascii_ok = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126)
+    if ascii_ok / len(sample) < 0.75:
+        return False
+    try:
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        # 中文 Windows 程序的 GBK 文本解不出 UTF-8，按"高位字节占比不高"放行
+        high = sum(1 for b in sample if b >= 0x80)
+        return high / len(sample) < 0.5
 
 
 def sniff(path: Path) -> FileInfo:
@@ -113,14 +126,18 @@ def sniff(path: Path) -> FileInfo:
     if head[:4] in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
         return _macho(path, size, head)
     if head[:4] == b"\xca\xfe\xba\xbe":
-        return FileInfo(path, size, "macho-fat", "Mach-O 通用二进制（多架构）", endian="big")
+        # Java .class 同 magic，靠 nfat_arch 区分：合理范围才是 fat Mach-O
+        nfat = int.from_bytes(head[4:8], "big") if len(head) >= 8 else 0
+        if 1 <= nfat <= 32:
+            return FileInfo(path, size, "macho-fat", "Mach-O 通用二进制（多架构）", endian="big")
+        return FileInfo(path, size, "java-class", "Java class 字节码")
     if head[:4] == b"\x00asm":
         return FileInfo(path, size, "wasm", "WebAssembly 模块", arch="wasm", bits=32, endian="little")
     if head[:8] == b"SQLite f":
         return FileInfo(path, size, "sqlite", "SQLite 数据库")
     if head[:4] == b"dex\n":
         return FileInfo(path, size, "dex", "Android DEX 字节码", arch="dalvik", endian="little")
-    if head[:4] == b"PK\x03\x04":
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
         return _zip(path, size)
     if head[:4] == b"MSCF":
         return FileInfo(path, size, "cab", "Windows Cabinet 安装包")
@@ -150,12 +167,14 @@ def sniff(path: Path) -> FileInfo:
     if asar:
         return asar
     if looks_text(head):
-        text = head.lstrip()
+        # BOM 会让首字符判断失效：HEX 文件带 BOM 时别被当成"未知格式"
+        probe = head[3:] if head[:3] == b"\xef\xbb\xbf" else head
+        text = probe.lstrip()
         if text[:1] == b":":
             return FileInfo(path, size, "ihex", "Intel HEX 固件镜像")
         if text[:2] in (b"S0", b"S1", b"S2", b"S3", b"S5", b"S7", b"S8", b"S9"):
             return FileInfo(path, size, "srec", "Motorola S-record 固件镜像")
-        if head[:4] == b"\xef\xbb\xbf{" or text[:1] == b"{":
+        if probe[:4] == b"\xef\xbb\xbf{" or text[:1] == b"{":
             try:
                 json.loads(path.read_text(encoding="utf-8-sig"))
                 return FileInfo(path, size, "json", "JSON 文本")
@@ -174,23 +193,35 @@ def sniff(path: Path) -> FileInfo:
 
 
 def _try_asar(path: Path):
-    """asar 头：u32 总长、u32 JSON 长、JSON（4 对齐）。"""
+    """asar 头：Chromium pickle 双层（真实布局）或早期单层都认。"""
     with open(path, "rb") as fh:
-        head = fh.read(8)
-        if len(head) < 8:
+        head = fh.read(16)
+        if len(head) < 16:
             return None
-        total, json_len = struct.unpack("<II", head)
-        if json_len < 8 or json_len + 8 > total or total > 64 << 20:
+        first, second, _third, _fourth = struct.unpack("<IIII", head)
+        if first == 4 and 8 < second <= 64 << 20:
+            fh.seek(0)
+            raw = fh.read(8 + second)
+        elif head[8:9] == b"{" and 8 < second <= 64 << 20:
+            fh.seek(8)
+            raw = head[:8] + fh.read(second)
+        else:
             return None
-        fh.seek(8)
-        blob = fh.read(json_len)
+    from .unpack import asar_header
+
     try:
-        header = json.loads(blob.rstrip(b"\x00").decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+        header, _start = asar_header(raw)
+    except Exception:
         return None
-    if not isinstance(header, dict) or "files" not in header:
-        return None
-    return FileInfo(path, path.stat().st_size, "asar", "Electron asar 归档", extra={"header": header})
+
+    def count(node: dict) -> int:
+        total = 0
+        for item in (node.get("files") or {}).values():
+            total += count(item) if "files" in item else 1
+        return total
+
+    return FileInfo(path, path.stat().st_size, "asar", "Electron asar 归档",
+                    extra={"header": header, "entries": count(header)})
 
 
 def packed_reasons(info: FileInfo) -> list[str]:
@@ -210,6 +241,35 @@ def packed_reasons(info: FileInfo) -> list[str]:
         section = max(hot, key=lambda item: item["entropy"])
         reasons.append(f"{section['name']} 熵 {section['entropy']}")
     return reasons if len(reasons) >= 2 else []
+
+
+# 节名 → 壳名。比"疑似加壳"有用得多：知道是 UPX 就能直接脱。
+PACKER_SECTIONS = {
+    "UPX0": "UPX", "UPX1": "UPX", "UPX2": "UPX", "UPX3": "UPX", "UPX!": "UPX",
+    ".aspack": "ASPack", ".adata": "ASPack", ".aspr": "ASProtect",
+    ".MPRESS1": "MPRESS", ".MPRESS2": "MPRESS", ".MPRESS3": "MPRESS",
+    ".vmp0": "VMProtect", ".vmp1": "VMProtect", ".vmp2": "VMProtect",
+    ".themida": "Themida", ".winlice": "Themida", ".enigma1": "Enigma", ".enigma2": "Enigma",
+    ".petite": "Petite", ".neolite": "Neolite", ".neolit": "Neolite",
+    ".pklstb": "PKLite", ".charmve": "Armadillo", ".perplex": "Perplex",
+    ".ccg": "CCG", ".pec1": "PECompact", ".pec2": "PECompact",
+}
+
+
+def packer_name(info: FileInfo) -> str:
+    """认出具体的壳；认不出返回空串。"""
+    if info.kind not in ("pe", "dll"):
+        return ""
+    names = [section["name"] for section in (info.extra.get("sections") or [])]
+    hits = {PACKER_SECTIONS[name] for name in names if name in PACKER_SECTIONS}
+    if len(hits) == 1:
+        return hits.pop()
+    if hits:
+        return "/".join(sorted(hits))
+    upper = [name.upper() for name in names]
+    if any(name.startswith("UPX") for name in upper):
+        return "UPX"
+    return ""
 
 
 def _pe(path: Path, size: int, head: bytes) -> FileInfo:
@@ -279,6 +339,8 @@ def _section_at(sections: list[dict], rva: int) -> str:
 
 
 def _elf(path: Path, size: int, head: bytes) -> FileInfo:
+    if len(head) < 16:
+        return FileInfo(path, size, "elf-broken", "ELF 头被截断（不到 16 字节）")
     bits = 64 if head[4] == 2 else 32
     endian = "little" if head[5] == 1 else "big"
     try:
@@ -319,6 +381,8 @@ def _elf(path: Path, size: int, head: bytes) -> FileInfo:
 
 
 def _macho(path: Path, size: int, head: bytes) -> FileInfo:
+    if len(head) < 8:
+        return FileInfo(path, size, "macho-broken", "Mach-O 头被截断")
     magic = head[:4]
     endian = "big" if magic in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf") else "little"
     fmt = ">" if endian == "big" else "<"

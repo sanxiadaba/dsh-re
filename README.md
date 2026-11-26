@@ -1,6 +1,7 @@
 # re
 
-一条命令看清一个**已经编译/打包好的东西**：固件、PE/ELF、安装包、APK、两版差异。
+一条命令看清一个**已经编译/打包好的东西**：固件、PE/ELF、安装包、APK、两版差异；
+需要动手时再连真硬件（J-Link/SWD、串口）。
 DSH skill + 命令行，不依赖 GUI 或 MCP。
 
 ## 30 秒上手
@@ -34,11 +35,14 @@ Linux / macOS 把 `.venv\Scripts` 换成 `.venv/bin`，`.\\re.cmd` 换成 `./re.
 ## 常用命令
 
 ```powershell
-.\re.cmd id      xxx.exe          # 是什么、什么架构、有没有壳
-.\re.cmd strings xxx.exe -k url   # 找 URL / 路径 / 密钥
-.\re.cmd fw      firmware.hex     # 向量表、入口、中断、代码区
+.\re.cmd id      xxx.exe          # 是什么、什么架构、什么壳、产品名/版本
+.\re.cmd strings xxx.exe -c 关键词   # 找 URL / 路径 / 密钥（ASCII/UTF-16/GBK）
+.\re.cmd fw      firmware.hex     # 向量表、入口、中断、向量目标
 .\re.cmd dis     firmware.hex --at 0x08000114 -n 20
-.\re.cmd unpack  app.apk -o out
+.\re.cmd unpack  app.exe -o out   # 剥包；UPX 壳直接脱
+.\re.cmd apk     app.apk          # 包名、框架、加固、原生库、SDK 线索
+.\re.cmd chip    --compare firmware.hex   # 芯片里是不是这一版
+.\re.cmd serial  -p COM11 --loopback      # 串口短接/接线自检
 ```
 
 完整命令与参数见 [`SKILL.md`](SKILL.md) 和 [`references/commands.md`](references/commands.md)，
@@ -52,7 +56,9 @@ Linux / macOS 把 `.venv\Scripts` 换成 `.venv/bin`，`.\\re.cmd` 换成 `./re.
 
 ## 引擎与数据
 
-`setup --rizin` 约 110 MB，`setup --ghidra` 约 400 MB（自带 JDK）。网络慢可以设 `HTTPS_PROXY`。
+`setup --rizin` 约 110 MB，`setup --ghidra` 约 570 MB（另外按需下 JDK，约 200 MB）。
+下载支持断点续传与重试；网络慢可以设 `HTTPS_PROXY`。可选工具（`upx`/`apktool`/`jadx`）放进
+`%LOCALAPPDATA%\dsh-re\tools`，`re doctor` 会显示有没有。
 
 都装在 `%LOCALAPPDATA%\dsh-re`（`DSH_RE_DATA` 可改），不进仓库、不进 PATH，卸载删掉这个目录即可。
 
@@ -64,9 +70,9 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\skills\re" -Target "<�
 
 ## 排错
 
-- 卡住先跑 `.\re.cmd doctor`，最后一行会告诉你缺什么、装什么。
+- 卡住先跑 `.\re.cmd doctor`，它会列出缺的引擎/可选工具，JDK 版本不够也会说。
 - `decompile` 第一次慢是正常的（Ghidra 要导入并分析）。
-- 加壳/加密文件被 `funcs`/`dis` 拒绝是预期行为，先 `unpack` 或从内存 dump。
+- 加壳/加密文件被 `funcs`/`dis` 拒绝是预期行为：`re id` 会说是哪种壳，UPX 用 `re unpack` 脱，其它从内存 dump。
 - `re: 还没建虚拟环境` / `依赖没装好`：按提示在仓库目录执行 `python -m venv .venv` 和 `.venv\Scripts\pip install -e .`。
 
 ## 相关项目
