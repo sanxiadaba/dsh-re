@@ -133,6 +133,8 @@ def probe(device: str | None = None, speed: int = 4000, devices_xml: str | None 
 def dump(out: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
          device: str | None = None, speed: int = 4000, force: bool = False,
          devices_xml: str | None = None) -> Path:
+    if size <= 0:
+        raise ReError(f"--size 必须为正，收到 {size}")
     if out.exists() and not force:
         raise ReError(f"目标已存在：{out}", hint="换个文件名，或加 --force 覆盖")
     work = _workdir()

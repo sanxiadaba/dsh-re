@@ -7,6 +7,7 @@ PE/ELF/Mach-O 交给 rizin 自己认。没有 rizin 就直接报错，不降级�
 
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ def _rizin(args: list[str], timeout: int = 180) -> str:
     return result.stdout
 
 
-def _rizin_json(args: list[str], timeout: int = 180):
+def _rizin_json(args: list[str], timeout: int = 180, allow_empty: bool = False):
     text = _rizin(args, timeout=timeout)
     # rizin 偶尔会在 JSON 前后打日志：从后往前找第一个能解析的起点，别被日志里的 [ 骗了
     decoder = json.JSONDecoder()
@@ -56,6 +57,8 @@ def _rizin_json(args: list[str], timeout: int = 180):
         except json.JSONDecodeError:
             continue
         return value
+    if allow_empty:
+        return []
     raise ReError(
         "rizin 输出的 JSON 解析不了",
         hint=f"命令：{' '.join(map(str, args))[-200:]}",
@@ -150,7 +153,12 @@ def dis(path: Path, at: int | None, sym: str | None, count: int,
             where = f" @ {_resolve_symbol(ctx, sym)}"
         elif ctx.vectors:
             where = f" @ {ctx.vectors[0]:#x}"
-        rows = _rizin_json(ctx.prefix + ["-c", f"pdj {count}{where}", ctx.file])
+        rows = _rizin_json(ctx.prefix + ["-c", f"pdj {count}{where}", ctx.file], allow_empty=True)
+        if not rows and sym and not at:
+            raise ReError(
+                f"找不到符号 {sym}",
+                hint="先用 re funcs 看有哪些函数；符号名不认识就别硬猜",
+            )
     return [
         {
             "addr": row["offset"],
@@ -162,22 +170,34 @@ def dis(path: Path, at: int | None, sym: str | None, count: int,
     ]
 
 
-def _resolve_symbol(ctx: Target, sym: str) -> str:
-    """把符号名换成地址再拼进命令：用户串不进 rizin 命令行（`;` 会注入命令）。"""
-    import re
+SAFE_SYM = re.compile(r"^[A-Za-z0-9_.$@:]+$")
 
+
+def _resolve_symbol(ctx: Target, sym: str) -> str:
+    """把符号名换成地址再拼进命令。
+
+    用户串不能直接进 rizin 命令行（`;` 能注入命令），所以先做字符白名单；
+    然后在函数表/符号表里找地址。找不到才把（已经安全的）名字交给 rizin 当 flag 用。
+    """
     if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", sym):
         return sym
-    rows = _rizin_json(ctx.prefix + ["-c", "isj", ctx.file], timeout=60)
-    flags = _rizin_json(ctx.prefix + ["-c", "fj", ctx.file], timeout=60)
-    for row in (rows if isinstance(rows, list) else []) + (flags if isinstance(flags, list) else []):
-        for key in ("name", "flagname", "realname"):
-            if row.get(key) == sym:
-                return f"{row.get('vaddr', row.get('offset', 0)):#x}"
-    raise ReError(
-        f"找不到符号 {sym}",
-        hint="先用 re funcs 看有哪些函数；符号名不认识就别硬猜",
-    )
+    if not SAFE_SYM.match(sym):
+        raise ReError(
+            f"符号名里有不安全字符：{sym}",
+            hint="只接受字母/数字/._$@:；先 re funcs 看真实符号名",
+        )
+    for command in ("aflj", "isj"):
+        rows = _rizin_json(ctx.prefix + ["-c", command, ctx.file], timeout=60, allow_empty=True)
+        for row in rows if isinstance(rows, list) else []:
+            for key in ("name", "flagname", "realname"):
+                if row.get(key) == sym:
+                    return f"{row.get('offset', row.get('vaddr', 0)):#x}"
+        for row in rows if isinstance(rows, list) else []:
+            for key in ("name", "flagname"):
+                value = row.get(key) or ""
+                if value.endswith("." + sym) and "offset" in row:
+                    return f"{row['offset']:#x}"
+    return sym
 
 
 def _guard_packed(path: Path, force: bool) -> None:

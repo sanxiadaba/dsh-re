@@ -54,8 +54,8 @@ def _safe_name(name: str) -> str:
             raise ReError(f"包里有尾部点/空格的路径，Windows 会写到别处，拒绝：{name}")
         if any(ch in part for ch in '<>"|?*'):
             raise ReError(f"包里有 Windows 非法字符，拒绝解压：{name}")
-        stem = part.split(".", 1)[0].upper()
-        if stem in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(COM|LPT)[0-9]", stem):
+        stem = part.split(".", 1)[0].rstrip("$").upper()
+        if stem in {"CON", "PRN", "AUX", "NUL", "CONIN", "CONOUT"} or re.fullmatch(r"(COM|LPT)[0-9]", stem):
             raise ReError(f"包里有 Windows 设备名，拒绝解压：{name}")
         parts.append(part)
     if not parts:
@@ -350,7 +350,9 @@ def unpack(path: Path, dest: Path, force: bool = False) -> tuple[list[dict], str
     if dest.exists() and any(dest.iterdir()) and not force:
         raise ReError(f"目标目录非空：{dest}", hint="换个 -o，或加 --force 覆盖")
     work = dest.with_name(dest.name + ".re-tmp")
-    if work.exists():
+    if work.is_file():
+        work.unlink()
+    elif work.exists():
         shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     try:

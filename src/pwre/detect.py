@@ -102,6 +102,14 @@ def looks_text(data: bytes) -> bool:
     sample = data[:4096]
     if not sample:
         return False
+    control = sum(1 for b in sample if b < 9 or 13 < b < 32)
+    if control / len(sample) > 0.05:
+        return False
+    try:
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        pass
     ascii_ok = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126)
     if ascii_ok / len(sample) < 0.75:
         return False

@@ -516,6 +516,8 @@ def cmd_mem(args):
         raise ReError(f"--size 要在 1 到 64 MiB 之间，收到 {args.size}")
     if args.out:
         target = Path(args.out)
+        if not target.parent.is_dir():
+            raise ReError(f"输出目录不存在：{target.parent}", hint="先建目录，或换个 --out")
         if target.exists() and not args.force:
             raise ReError(f"目标已存在：{target}", hint="换个文件名，或加 --force 覆盖")
         count = mem.dump(args.pid, args.addr, args.size, target)
@@ -680,6 +682,8 @@ def cmd_hex(args):
         if not image.total:
             raise ReError("映像里没有数据，转 BIN 没有意义")
         target = Path(args.out)
+        if not target.parent.is_dir():
+            raise ReError(f"输出目录不存在：{target.parent}", hint="先建目录，或换个 --out")
         if target.exists() and not args.force:
             raise ReError(f"目标已存在：{target}", hint="换个文件名，或加 --force 覆盖")
         base, flat = image.to_flat(args.fill)

@@ -101,14 +101,21 @@ def _packer(names: set[str], manifest: dict, dex_sizes: list[int], total: int) -
 
 def analyze(path: Path) -> dict:
     path = Path(path)
-    with zipfile.ZipFile(path) as zf:
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ReError(f"{path.name} 读不了（{exc}）", hint="包可能截断或损坏；换个来源重下")
+    with zf:
         infos = [info for info in zf.infolist() if not info.is_dir()]
         names = {info.filename for info in infos}
         sizes = {info.filename: info.file_size for info in infos}
         if "AndroidManifest.xml" not in names:
             raise ReError(f"{path.name} 里没有 AndroidManifest.xml，不是 APK")
 
-        raw = _read_sample(zf, "AndroidManifest.xml", 8 << 20)
+        try:
+            raw = _read_sample(zf, "AndroidManifest.xml", 8 << 20)
+        except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+            raise ReError(f"AndroidManifest.xml 读不出来：{exc}", hint="压缩数据损坏，可能是被改坏的包")
         manifest = axml.manifest_summary(axml.parse(raw))
 
         dex = sorted(

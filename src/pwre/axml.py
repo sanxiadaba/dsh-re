@@ -31,8 +31,14 @@ class Element:
 def _string_pool(data: bytes, offset: int) -> list[str]:
     header = struct.unpack_from("<HHI", data, offset)
     size = header[2]
+    if offset + 28 > len(data):
+        raise ReError("字符串池头被截断")
     count, _styles, flags, strings_start = struct.unpack_from("<IIII", data, offset + 8)
+    if count > 1_000_000 or strings_start > size:
+        raise ReError(f"字符串池长度不合理（count={count}）")
     offsets_at = offset + header[1]
+    if offsets_at + count * 4 > len(data):
+        raise ReError(f"字符串池偏移表越界（count={count}）")
     utf8 = bool(flags & 0x100)
     base = offset + strings_start
     out = []
