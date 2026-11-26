@@ -28,25 +28,42 @@ def _processor_for(image) -> str:
     return "ARM:LE:32:Cortex" if table.reset & 1 else "ARM:LE:32:v7"
 
 
-def _prepare(path: Path, base: int | None):
-    """返回 (输入文件, loader 参数列表, 是否需要之后删除)。"""
+# Ghidra 的启动脚本是 .bat，参数要过 cmd 解析。路径里的空格、括号、& 会在
+# analyzeHeadless.bat 内部被拆开（`...) was unexpected at this time`）。
+# 与其和 cmd 的引号规则搏斗，不如把输入摊到一个干净路径上再交给它。
+HOSTILE = set(' ()[]{}&^%!,;=\'"')
+
+
+def _needs_staging(path: Path) -> bool:
+    return any(ch in HOSTILE for ch in str(path))
+
+
+def _stage_dir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="re-stage-", dir=str(engines.data_dir())))
+
+
+def _prepare(path: Path, base: int | None, work: Path):
+    """返回 (输入文件, loader 参数列表)。输入一律落在 work 里，绝不让 cmd 见到用户路径。"""
     kind = sniff(path).kind
     if kind in ("ihex", "srec"):
         image = firmware.load(path, base)
         flat_base, flat = image.to_flat()
-        handle, name = tempfile.mkstemp(prefix="re-ghidra-", suffix=".bin")
-        os.close(handle)
-        temp = Path(name)
+        temp = work / "input.bin"
         temp.write_bytes(flat)
         processor = _processor_for(image)
         loader = ["-loader", "BinaryLoader", "-loader-baseAddr", hex(flat_base)]
         if processor:
             loader += ["-processor", processor]
-        return temp, loader, True
+        return temp, loader
+    if _needs_staging(path):
+        temp = work / ("input" + path.suffix.lower())
+        shutil.copy2(path, temp)
+        loader = ["-loader", "BinaryLoader", "-loader-baseAddr", hex(base)] if base is not None else []
+        return temp, loader
     if base is not None:
         loader = ["-loader", "BinaryLoader", "-loader-baseAddr", hex(base)]
-        return path, loader, False
-    return path, [], False
+        return path, loader
+    return path, []
 
 
 def decompile_all(path: Path, out_file: Path, base: int | None = None,
@@ -57,17 +74,15 @@ def decompile_all(path: Path, out_file: Path, base: int | None = None,
     env = dict(os.environ)
     env["JAVA_HOME"] = str(Path(java).parent.parent)
     project_root = Path(tempfile.mkdtemp(prefix="re-proj-", dir=str(engines.data_dir())))
-    temp_input = None
+    work = _stage_dir()
     try:
-        target, loader, needs_cleanup = _prepare(path, base)
-        if needs_cleanup:
-            temp_input = target
-        out_file.parent.mkdir(parents=True, exist_ok=True)
+        target, loader = _prepare(path, base, work)
+        staged_out = work / "all.c"
         command = [
             exe,
             str(project_root), "re",
             "-import", str(target),
-            "-postScript", "DumpAll.java", str(out_file),
+            "-postScript", "DumpAll.java", str(staged_out),
             "-scriptPath", str(SCRIPT_DIR),
             "-deleteProject",
             "-analysisTimeoutPerFile", "600",
@@ -78,10 +93,11 @@ def decompile_all(path: Path, out_file: Path, base: int | None = None,
         if marker not in text:
             tail = "\n".join(text.strip().splitlines()[-8:])
             raise ReError("Ghidra 批量反编译没给出结果", hint=tail[:400])
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged_out, out_file)
         return text.split(marker, 1)[1].splitlines()[0].strip()
     finally:
-        if temp_input and temp_input.exists():
-            temp_input.unlink()
+        shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(project_root, ignore_errors=True)
 
 
@@ -93,11 +109,9 @@ def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
     env["JAVA_HOME"] = str(Path(java).parent.parent)
 
     project_root = Path(tempfile.mkdtemp(prefix="re-proj-", dir=str(engines.data_dir())))
-    temp_input = None
+    work = _stage_dir()
     try:
-        target, loader, needs_cleanup = _prepare(path, base)
-        if needs_cleanup:
-            temp_input = target
+        target, loader = _prepare(path, base, work)
         arg = f"0x{at:08x}" if at is not None else (f"sym:{sym}" if sym else "")
         if not arg:
             raise ReError("要给 --at 或 --sym", hint="先用 re fw / re funcs 找地址")
@@ -128,6 +142,5 @@ def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
         _, name, entry = lines[0].split(" ", 2)
         return {"name": name, "entry": entry.strip(), "c": "\n".join(lines[1:]).strip()}
     finally:
-        if temp_input and temp_input.exists():
-            temp_input.unlink()
+        shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(project_root, ignore_errors=True)

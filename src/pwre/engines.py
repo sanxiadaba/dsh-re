@@ -95,6 +95,49 @@ def tool_path(name: str) -> str | None:
     }.get(name)
 
 
+# 可选工具：缺了不影响 doctor 通过，但相关命令会明确告诉你缺什么。
+OPTIONAL = {
+    "upx": "UPX 脱壳（re unpack 对 UPX 壳的 PE 直接调用它）",
+    "apktool": "APK 反编译/回编译（re apk unpack 用，需要 java）",
+    "jadx": "dex → Java 源码（re apk java 用）",
+}
+
+
+def tools_dir() -> Path:
+    path = data_dir() / "tools"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def upx_path() -> str | None:
+    for candidate in (tools_dir() / "upx" / _exe("upx"), tools_dir() / "upx" / "upx.exe"):
+        if candidate.is_file():
+            return str(candidate)
+    return _which("upx")
+
+
+def apktool_path() -> str | None:
+    jar = tools_dir() / "apktool" / "apktool.jar"
+    if jar.is_file():
+        return str(jar)
+    return _which("apktool")
+
+
+def jadx_path() -> str | None:
+    base = tools_dir() / "jadx"
+    for candidate in (base / "bin" / "jadx.bat", base / "bin" / "jadx", tools_dir() / "jadx" / "jadx.bat"):
+        if candidate.is_file():
+            return str(candidate)
+    return _which("jadx")
+
+
+def optional_status() -> list[dict]:
+    return [
+        {"name": name, "path": globals()[f"{name}_path"](), "purpose": purpose}
+        for name, purpose in OPTIONAL.items()
+    ]
+
+
 def require(name: str) -> str:
     """拿不到就报错，不给降级方案。"""
     path = tool_path(name)
@@ -173,29 +216,69 @@ def github_asset_any(repo: str, patterns: list[str]) -> tuple[str, str]:
     )
 
 
-def download(url: str, dest: Path, label: str) -> Path:
-    """流式下载，进度打到 stderr（--json 时 stdout 仍干净）。"""
+def download(url: str, dest: Path, label: str, retries: int = 5) -> Path:
+    """带 Range 续传与重试的下载，进度打到 stderr（--json 时 stdout 仍干净）。
+
+    慢网/断流的现实：单连接 + 固定 30s 超时必然失败（现场实测过两次）。
+    这里保留 .part，断开就用 Range 从断点继续；只有拿到完整字节数才算成功。
+    """
+    import time
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
     print(f"下载 {label}：{url}", file=sys.stderr)
-    with _opener().open(_request(url), timeout=30) as response:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        step = max(total // 20, 1 << 20) if total else 8 << 20
-        next_mark = step
-        with open(part, "wb") as fh:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                done += len(chunk)
-                if done >= next_mark:
-                    pct = f" {done * 100 // total}%" if total else ""
-                    print(f"  {done / (1 << 20):.0f} MB{pct}", file=sys.stderr)
-                    next_mark += step
+    total = 0
+    for attempt in range(1, retries + 1):
+        have = part.stat().st_size if part.is_file() else 0
+        if total and have >= total:
+            break
+        headers = {"Range": f"bytes={have}-"} if have else {}
+        request = _request(url)
+        for key, value in headers.items():
+            request.add_header(key, value)
+        try:
+            with _opener().open(request, timeout=120) as response:
+                if response.status == 200 and have:
+                    # 服务端不认 Range：从头来，别把旧字节接在后面
+                    print("  服务端不支持续传，重新开始", file=sys.stderr)
+                    have = 0
+                declared = int(response.headers.get("Content-Length") or 0)
+                if not total:
+                    total = declared + have
+                mode = "ab" if have else "wb"
+                step = max(total // 20, 1 << 20) if total else 8 << 20
+                next_mark = (have // step + 1) * step
+                with open(part, mode) as fh:
+                    while True:
+                        chunk = response.read(1 << 20)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        have += len(chunk)
+                        if have >= next_mark:
+                            pct = f" {have * 100 // total}%" if total else ""
+                            print(f"  {have / (1 << 20):.0f} MB{pct}", file=sys.stderr)
+                            next_mark += step
+            if total and part.stat().st_size >= total:
+                break
+            print(f"  只下到 {part.stat().st_size}/{total or '?'} 字节，重试 {attempt}/{retries}", file=sys.stderr)
+        except Exception as exc:  # 网络、超时、SSL
+            size = part.stat().st_size if part.is_file() else 0
+            print(f"  第 {attempt} 次中断（{type(exc).__name__}: {exc}），已下 {size} 字节", file=sys.stderr)
+            if attempt == retries:
+                raise ReError(
+                    f"下载 {label} 失败：{exc}",
+                    hint=f"已保留 {part}，网络恢复后重跑同一条命令会从断点继续；慢网可设 HTTPS_PROXY",
+                )
+            time.sleep(min(2 * attempt, 8))
+    size = part.stat().st_size if part.is_file() else 0
+    if total and size < total:
+        raise ReError(
+            f"下载 {label} 不完整：{size}/{total} 字节",
+            hint=f"保留的 {part} 会在下次运行续传",
+        )
     part.replace(dest)
-    print(f"  -> {dest}", file=sys.stderr)
+    print(f"  -> {dest}（{size / (1 << 20):.1f} MB）", file=sys.stderr)
     return dest
 
 
@@ -230,19 +313,33 @@ def _install_zip(name: str, url: str, label: str) -> Path:
 def install_rizin() -> Path:
     tag, url = github_asset_any(
         "rizinorg/rizin",
-        [r"rizin-windows-static-v.*\.zip$", r"rizin-windows-shared64-v.*\.zip$"],
+        [r"rizin-windows-static-v.*\.zip$", r"rizin-windows-shared64-v.*\.zip$", r"rizin-windows.*\.zip$"],
     )
     print(f"rizin {tag}", file=sys.stderr)
     path = _install_zip("rizin", url, "rizin")
     if not (path / "bin" / "rizin.exe").is_file():
-        raise ReError(f"rizin 解压后没有 bin/rizin.exe：{path}", hint="删掉该目录后重试")
+        raise ReError(f"rizin 解压后没有 bin/rizin.exe：{path}", hint=f"看看目录里到底是什么：{_tree_sample(path)}")
     return path
 
 
 def install_ghidra() -> Path:
     tag, url = github_asset("NationalSecurityAgency/ghidra", r"ghidra_.*_PUBLIC_.*\.zip$")
-    print(f"ghidra {tag}（约 400 MB，慢慢下）", file=sys.stderr)
-    return _install_zip("ghidra", url, "ghidra")
+    print(f"ghidra {tag}（约 570 MB，慢慢下）", file=sys.stderr)
+    path = _install_zip("ghidra", url, "ghidra")
+    if not ghidra_headless():
+        raise ReError(
+            f"ghidra 解压后找不到 support/analyzeHeadless：{path}",
+            hint=f"目录里是：{_tree_sample(path)}",
+        )
+    return path
+
+
+def _tree_sample(path: Path, limit: int = 6) -> str:
+    try:
+        names = sorted(item.name for item in Path(path).iterdir())[:limit]
+    except OSError:
+        return "（读不到）"
+    return ", ".join(names) or "（空）"
 
 
 def ghidra_java_min() -> int:
@@ -250,18 +347,22 @@ def ghidra_java_min() -> int:
     root = ghidra_headless()
     if not root:
         return 25
-    props = Path(root).parent / "Ghidra" / "application.properties"
-    try:
-        for line in props.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("application.java.min="):
-                return int(line.split("=", 1)[1])
-    except (OSError, ValueError):
-        pass
+    base = Path(root).parent
+    for candidate in (base.parent / "Ghidra" / "application.properties",
+                      base / "Ghidra" / "application.properties"):
+        try:
+            for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("application.java.min="):
+                    return int(line.split("=", 1)[1])
+        except (OSError, ValueError):
+            continue
     return 25
 
 
 def java_version(java: str | None = None) -> int:
-    """主版本号；拿不到返回 0。"""
+    """主版本号：JDK 8 的 "1.8.0_411" 归一到 8；拿不到返回 0。"""
+    import re
+
     exe = java or java_path()
     if not exe:
         return 0
@@ -270,13 +371,20 @@ def java_version(java: str | None = None) -> int:
     except (OSError, subprocess.TimeoutExpired):
         return 0
     text = (result.stderr or "") + (result.stdout or "")
-    for token in text.replace('"', " ").split():
-        if token[:1].isdigit() and "." in token:
-            try:
-                return int(token.split(".")[0])
-            except ValueError:
-                continue
-    return 0
+    match = re.search(r'version "([0-9][0-9._]*)', text)
+    if not match:
+        return 0
+    parts = re.split(r"[._]", match.group(1))
+    try:
+        major = int(parts[0])
+    except (ValueError, IndexError):
+        return 0
+    if major == 1 and len(parts) > 1:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 0
+    return major
 
 
 def install_java(version: int | None = None) -> Path:
@@ -323,22 +431,94 @@ def status() -> list[dict]:
     rows = []
     for name, purpose in ENGINES.items():
         path = tool_path(name)
-        rows.append({"name": name, "path": path, "ok": bool(path), "purpose": purpose})
+        note = ""
+        ok = bool(path)
+        if name == "java" and path:
+            version = java_version(path)
+            needed = ghidra_java_min() if ghidra_headless() else 0
+            if needed and version < needed:
+                ok = False
+                note = f"版本过低：{version} < Ghidra 要求的 {needed}（re setup --java）"
+            else:
+                note = f"版本 {version}" if version else ""
+        rows.append({"name": name, "path": path, "ok": ok, "purpose": purpose, "note": note})
     return rows
 
 
-def run(cmd, timeout=120, cwd=None, env=None) -> subprocess.CompletedProcess:
-    """统一的子进程调用：不让任何外部工具把 DSH 挂死。"""
+def _batch_wrapper(cmd: list) -> tuple[list, Path | None]:
+    """把 .bat/.cmd 调用包进一个临时 .cmd。
+
+    直接 CreateProcess 一个 .bat 时，参数由 cmd.exe 重新解析：路径里的空格、括号、
+    & 会把命令行拆开（`...) was unexpected at this time`）。写一个参数已逐个加引号的
+    包装器交给 cmd，解析就只剩一层。文件按系统 ANSI 代码页写，中文路径才不会乱码。
+    """
+    if os.name != "nt" or not str(cmd[0]).lower().endswith((".bat", ".cmd")):
+        return list(cmd), None
+    quoted = []
+    for arg in cmd:
+        text = str(arg).replace("%", "%%").replace('"', '""')
+        quoted.append(f'"{text}"')
+    handle, name = tempfile.mkstemp(prefix="re-run-", suffix=".cmd")
+    os.close(handle)
+    path = Path(name)
+    body = "@echo off\r\n" + " ".join(quoted) + "\r\nexit /b %ERRORLEVEL%\r\n"
+    encoding = "mbcs" if os.name == "nt" else "utf-8"
     try:
-        return subprocess.run(
+        path.write_bytes(body.encode(encoding))
+    except UnicodeEncodeError:
+        path.unlink(missing_ok=True)
+        return list(cmd), None
+    return ["cmd.exe", "/d", "/c", str(path)], path
+
+
+def _kill_tree(proc) -> None:
+    """连孙进程一起杀。
+
+    analyzeHeadless.bat 会再拉起 java.exe：只 kill 直接子进程的话，孙进程还攥着
+    管道，communicate() 会一直等到分析结束——超时就形同虚设。
+    """
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=30)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except OSError:
+            proc.kill()
+
+
+def run(cmd, timeout=120, cwd=None, env=None) -> subprocess.CompletedProcess:
+    """统一的子进程调用：不让任何外部工具把 DSH 挂死（含超时后的进程树清理）。"""
+    cmd, wrapper = _batch_wrapper(list(cmd))
+    try:
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             cwd=cwd,
             env=env,
+            text=True,
             errors="replace",
-            stdin=subprocess.DEVNULL,
         )
+    except OSError as exc:
+        if wrapper is not None:
+            wrapper.unlink(missing_ok=True)
+        raise ReError(f"启动不了外部工具 {cmd[0]}：{exc}", hint="确认引擎还在（re doctor）")
+    try:
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise ReError(f"命令超时（{timeout}s）：{' '.join(map(str, cmd))}", hint="加大超时或缩小分析范围")
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise ReError(
+            f"命令超时（{timeout}s）：{' '.join(map(str, cmd))}",
+            hint="加大超时（--timeout）或缩小分析范围；进程树已强制结束",
+        )
+    finally:
+        if wrapper is not None:
+            wrapper.unlink(missing_ok=True)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
