@@ -6,6 +6,7 @@
 """
 
 import zipfile
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -114,7 +115,7 @@ def analyze(path: Path) -> dict:
 
         try:
             raw = _read_sample(zf, "AndroidManifest.xml", 8 << 20)
-        except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+        except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error) as exc:
             raise ReError(f"AndroidManifest.xml 读不出来：{exc}", hint="压缩数据损坏，可能是被改坏的包")
         manifest = axml.manifest_summary(axml.parse(raw))
 
@@ -142,7 +143,7 @@ def analyze(path: Path) -> dict:
                 continue
             try:
                 data = _read_sample(zf, name, 1 << 20)
-            except (zipfile.BadZipFile, OSError):
+            except (zipfile.BadZipFile, OSError, zlib.error):
                 continue
             level = entropy(data)
             if level > 7.5:
