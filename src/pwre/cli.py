@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="--out 已存在也覆盖")
     p.set_defaults(func=cmd_hex)
 
-    p = sub.add_parser("fw", help="固件：向量表、入口、中断、代码区")
+    p = sub.add_parser("fw", help="固件：向量表、入口、中断、向量目标")
     p.add_argument("path")
     p.add_argument("--base", type=_number, default=None, help="裸 BIN 的加载地址，如 0x08000000")
     p.add_argument("--vectors", action="store_true", help="列出全部中断向量")

@@ -54,7 +54,7 @@ re setup --ghidra    # 反编译（自动带 JDK）
 | `re strings 文件` | 找 URL、路径、密钥、格式串；`-k url` / `-c 关键词` / `-l 20` |
 | `re pe 文件` / `re elf 文件` | 节区、导入导出、资源、加固 |
 | `re hex 文件 [--to bin --out x]` | HEX/S-record 段表、校验、转 BIN |
-| `re fw 文件 [--vectors]` | Cortex-M：SP、Reset、异常、中断表、代码区 |
+| `re fw 文件 [--vectors]` | Cortex-M：SP、Reset、异常、中断表、向量目标 |
 | `re fwmap 文件 [-o 目录]` | 一次产出全量反汇编、函数地图、外设引用（固件结构分析） |
 | `re funcs 文件 [--deep]` | 函数表；固件用向量表当根，PE 默认浅扫 |
 | `re dis 文件 --at 0x... -n 20` | 反汇编；不给 `--at` 时从入口/Reset 开始；有符号用 `--sym` |
