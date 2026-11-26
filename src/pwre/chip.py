@@ -93,8 +93,9 @@ def _words(text: str) -> dict[int, int]:
 
 
 def _dump_to(work: Path, base: int, size: int, device: str | None, speed: int,
-             devices_xml: str | None = None) -> bytes:
-    text = _run(_head(device, speed, devices_xml) + [f"savebin flash.bin, {base:#010x}, {size:x}"], work)
+             devices_xml: str | None = None, timeout: int = 120) -> bytes:
+    text = _run(_head(device, speed, devices_xml) + [f"savebin flash.bin, {base:#010x}, {size:x}"],
+                work, timeout=timeout)
     produced = work / "flash.bin"
     if not produced.is_file() or produced.stat().st_size < size:
         tail = "\n".join(text.strip().splitlines()[-6:])
@@ -105,14 +106,15 @@ def _dump_to(work: Path, base: int, size: int, device: str | None, speed: int,
 # ------------------------------------------------------------------ 四个动作
 
 
-def probe(device: str | None = None, speed: int = 4000, devices_xml: str | None = None) -> dict:
+def probe(device: str | None = None, speed: int = 4000, devices_xml: str | None = None,
+          timeout: int = 120) -> dict:
     """连上芯片，读 CPUID、向量表。"""
     work = _workdir()
     try:
         text = _run(_head(device, speed, devices_xml) + [
             "mem 0xE000ED00, 0x10",
             f"mem {DEFAULT_FLASH:#010x}, 0x40",
-        ], work)
+        ], work, timeout=timeout)
         words = _words(text)
         if not words:
             tail = "\n".join(text.strip().splitlines()[-6:])
@@ -132,16 +134,18 @@ def probe(device: str | None = None, speed: int = 4000, devices_xml: str | None 
 
 def dump(out: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
          device: str | None = None, speed: int = 4000, force: bool = False,
-         devices_xml: str | None = None) -> Path:
+         devices_xml: str | None = None, timeout: int = 120) -> Path:
     if size <= 0:
         raise ReError(f"--size 必须为正，收到 {size}")
+    if size > 16 << 20:
+        raise ReError(f"--size 最多 16 MiB，收到 {size:,}")
     if out.exists() and out.is_dir():
         raise ReError(f"--dump 的目标是个目录：{out}", hint="给一个文件名，例如 chip.bin")
     if out.exists() and not force:
         raise ReError(f"目标已存在：{out}", hint="换个文件名，或加 --force 覆盖")
     work = _workdir()
     try:
-        data = _dump_to(work, base, size, device, speed, devices_xml)
+        data = _dump_to(work, base, size, device, speed, devices_xml, timeout)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -149,8 +153,16 @@ def dump(out: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
     return out
 
 
+FIRMWARE_KINDS = ("ihex", "srec", "unknown")
+
+
 def _load_image(path: Path, base: int):
     kind = sniff(path).kind
+    if kind not in FIRMWARE_KINDS:
+        raise ReError(
+            f"{path.name} 是 {kind}，不是固件镜像",
+            hint="这里只吃 .hex / .srec / 裸 .bin；PE/ELF 用 re pe / re elf",
+        )
     if kind in ("ihex", "srec"):
         return firmware.load(path, None)
     return firmware.load(path, base)
@@ -158,7 +170,7 @@ def _load_image(path: Path, base: int):
 
 def compare(path: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
             device: str | None = None, speed: int = 4000,
-            devices_xml: str | None = None) -> dict:
+            devices_xml: str | None = None, timeout: int = 120) -> dict:
     """把芯片 flash 与一个固件文件（HEX/SREC/BIN）逐字节比对。
 
     读回窗口自动放大到"文件跨度"：默认 32 KiB 会让 40 KiB 的镜像整段判成不同，
@@ -169,7 +181,7 @@ def compare(path: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
     need = max(size, high - base)
     work = _workdir()
     try:
-        chip = _dump_to(work, base, need, device, speed, devices_xml)
+        chip = _dump_to(work, base, need, device, speed, devices_xml, timeout)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -198,7 +210,7 @@ def compare(path: Path, base: int = DEFAULT_FLASH, size: int = DEFAULT_SIZE,
 
 
 def flash(path: Path, device: str | None, base: int = DEFAULT_FLASH, speed: int = 4000,
-          verify: bool = True, devices_xml: str | None = None) -> dict:
+          verify: bool = True, devices_xml: str | None = None, timeout: int = 900) -> dict:
     """烧写固件，然后读回逐字节校验。
 
     成功与否只看校验结果：J-Link 连上就会打印 O.K.，用"输出里有 O.K."判断烧写成功
@@ -226,7 +238,7 @@ def flash(path: Path, device: str | None, base: int = DEFAULT_FLASH, speed: int 
         result = {"wrote": str(path), "verify": "skipped"}
         if verify:
             need = max(DEFAULT_SIZE, image.span[1] - base)
-            chip = _dump_to(work, base, need, device, speed, devices_xml)
+            chip = _dump_to(work, base, need, device, speed, devices_xml, timeout)
             bad = 0
             for segment in image.segments:
                 offset = segment.addr - base

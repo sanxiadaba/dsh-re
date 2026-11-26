@@ -88,6 +88,8 @@ def loopback(port: str, baud: int, probe: bytes | None = None, wait: float = 0.6
 
 def exchange(port: str, baud: int, send: str, seconds: float = 1.0) -> dict:
     payload = _decode(send)
+    if not payload:
+        raise ReError("要发的内容是空的", hint="给 text:内容 或 hex:01 02；空串发不出去")
     handle = _open(port, baud)
     try:
         handle.write(payload)

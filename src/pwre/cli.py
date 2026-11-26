@@ -41,6 +41,10 @@ def main(argv=None):
         return exc.code
     except KeyboardInterrupt:
         return 130
+    except (PermissionError, FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
+        print(f"re: 文件操作失败：{exc}", file=sys.stderr)
+        print("    目标可能不存在、是目录，或没有写权限", file=sys.stderr)
+        return 1
     except Exception as exc:
         if os.environ.get("RE_DEBUG"):
             raise
@@ -200,10 +204,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="确认烧写（会擦除整个 flash）")
     p.add_argument("--device", default=None, help="J-Link 器件名，例如 PY32F030")
     p.add_argument("--base", type=_number, default=0x08000000, help="flash 起始地址")
-    p.add_argument("--size", type=_number, default=0x8000, help="读多少字节")
+    p.add_argument("--size", type=_number, default=0x8000, help="读多少字节（上限 16 MiB）")
     p.add_argument("--speed", type=int, default=4000, help="SWD 速度 kHz")
     p.add_argument("--devices-xml", default=None, help="额外的 J-Link 器件库（如 Keil 器件包里的 JLinkDevices.xml）")
     p.add_argument("--force", action="store_true", help="--dump 的目标已存在也覆盖")
+    p.add_argument("--timeout", type=int, default=120, help="单次 J-Link 调用超时秒数（默认 120）")
     p.set_defaults(func=cmd_chip)
 
     p = sub.add_parser("serial", help="串口：列端口、监听、环回自检、收发")
@@ -535,6 +540,8 @@ def cmd_mem(args):
 
 def cmd_proto(args):
     path = Path(args.path)
+    if not path.is_file():
+        raise ReError(f"不是文件：{path}")
     data = path.read_bytes()
     if not args.frame or args.frame < 1:
         raise ReError("要给正的 --frame（帧长）", hint="先 re hex / re id 看清楚结构；按帧切开才能看字段")
@@ -581,6 +588,8 @@ def cmd_decompile_all(args):
 def cmd_fwmap(args):
     path = Path(args.path)
     out = Path(args.out) if args.out else path.with_name(path.stem + ".fwmap")
+    if out.exists() and out.is_file():
+        raise ReError(f"-o 是个文件：{out}", hint="fwmap 要一个目录，例如 -o out/fwmap")
     if out.exists() and any(out.iterdir()) and not args.force:
         raise ReError(f"输出目录非空：{out}", hint="换个 -o，或加 --force 覆盖")
     result = fwmap.run(path, out, args.base, partial=args.partial)
@@ -782,7 +791,7 @@ def cmd_chip(args):
                 hint="确认目标无误后加 --yes；不确定就先 --compare",
             )
         result = chip.flash(Path(args.path), args.device, args.base, args.speed,
-                            devices_xml=args.devices_xml)
+                            devices_xml=args.devices_xml, timeout=max(args.timeout, 60))
         lines = [f"烧写     {result['wrote']}", f"校验     {result['verify']}"]
         emit(args, lines, result)
         return 0
@@ -790,7 +799,7 @@ def cmd_chip(args):
         if not args.path:
             raise ReError("--compare 要给固件文件")
         data = chip.compare(Path(args.path), args.base, args.size, args.device, args.speed,
-                            devices_xml=args.devices_xml)
+                            devices_xml=args.devices_xml, timeout=args.timeout)
         head = "完全相同" if data["diff"] == 0 else f"{data['diff']:,} 字节不同"
         lines = [
             f"文件     {data['file']}  {data['file_size']:,} 字节",
@@ -807,11 +816,11 @@ def cmd_chip(args):
         return 0 if data["diff"] == 0 else 1
     if args.dump:
         out = chip.dump(Path(args.dump), args.base, args.size, args.device, args.speed,
-                        force=args.force, devices_xml=args.devices_xml)
+                        force=args.force, devices_xml=args.devices_xml, timeout=args.timeout)
         emit(args, [f"读回     {out}（{out.stat().st_size:,} 字节，{args.base:#x} 起）"],
              {"path": str(out), "size": out.stat().st_size})
         return 0
-    info = chip.probe(args.device, args.speed, args.devices_xml)
+    info = chip.probe(args.device, args.speed, args.devices_xml, timeout=args.timeout)
     lines = [
         f"器件     {info['device']}",
         f"CPUID    {info['cpuid']:#010x}",
@@ -847,6 +856,10 @@ def cmd_serial(args):
             lines.append("（没有收到任何字节）")
         emit(args, lines, {"sent": data["sent"].hex(), "received": data["received"].hex()})
         return 0
+    if args.listen < 0:
+        raise ReError(f"--listen 不能为负：{args.listen}")
+    if args.send is not None and not args.send.strip():
+        raise ReError("--send 是空的", hint="给 text:内容 或 hex:01 02")
     seconds = args.listen or 2.0
     data = serialport.listen(args.port, args.baud, seconds)
     lines = [f"端口     {args.port} @ {args.baud}，监听 {seconds:g}s", f"收到     {len(data)} 字节"]

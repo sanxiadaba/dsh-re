@@ -151,11 +151,14 @@ def analyze(path: Path) -> dict:
         blobs.sort(key=lambda item: -item["size"])
 
         sample = b""
-        for name in [n for n in sorted(names) if n.startswith("classes") and n.endswith(".dex")][:1]:
-            sample += _read_sample(zf, name, 2 << 20)
+        pick = [n for n in sorted(names) if n.startswith("classes") and n.endswith(".dex")][:1]
         app_so = next((n for n in sorted(names) if n.endswith("libapp.so")), None)
-        if app_so:
-            sample += _read_sample(zf, app_so, 4 << 20)
+        for name in pick + ([app_so] if app_so else []):
+            try:
+                sample += _read_sample(zf, name, 4 << 20)
+            except (zipfile.BadZipFile, OSError, RuntimeError, zlib.error):
+                # 单个条目坏不该让整条命令崩：跳过它，结论仍然给
+                continue
 
     text = sample.decode("latin-1", "replace")
 
