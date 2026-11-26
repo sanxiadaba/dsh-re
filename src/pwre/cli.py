@@ -363,6 +363,8 @@ def cmd_strings(args):
     path = Path(args.path)
     if not path.is_file():
         raise ReError(f"不是文件：{path}")
+    if args.min < 2:
+        warn(f"-n {args.min} 太小，按 2 处理（最短长度下限就是 2）")
     encodings = tuple(args.encoding) if args.encoding else scan.ENCODINGS
     if args.no_utf16:
         encodings = tuple(name for name in encodings if not name.startswith("utf16"))
