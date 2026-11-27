@@ -66,6 +66,25 @@ def _prepare(path: Path, base: int | None, work: Path):
     return path, []
 
 
+def _vector_seeds(path: Path, base: int | None) -> list[int]:
+    """向量表里的 Thumb 入口（含 Reset/异常/IRQ），给 Ghidra 当函数种子。"""
+    from . import armvec
+
+    try:
+        kind = sniff(path).kind
+    except Exception:
+        return []
+    if kind not in ("ihex", "srec") and base is None:
+        return []
+    try:
+        image = firmware.load(path, base)
+        table = armvec.find_table(image)
+    except ReError:
+        return []
+    seeds = {value & ~1 for index, value in table.entries if index >= 1 and value & 1}
+    return sorted(seeds)
+
+
 def decompile_all(path: Path, out_file: Path, base: int | None = None,
                   timeout: int = 900) -> str:
     """一次性把目标里所有函数反编译到 out_file（导入+分析只做一遍）。"""
@@ -78,11 +97,19 @@ def decompile_all(path: Path, out_file: Path, base: int | None = None,
     try:
         target, loader = _prepare(path, base, work)
         staged_out = work / "all.c"
+        # 固件：把向量表里的入口写成种子文件——BinaryLoader 不知道向量表，
+        # 不给种子的话 Reset/NMI/ISR 根本不会成为函数，反编译结果里就缺它们
+        seed_args = []
+        seeds = _vector_seeds(path, base)
+        if seeds:
+            seed_file = work / "seeds.txt"
+            seed_file.write_text("\n".join(f"0x{addr:08x}" for addr in seeds) + "\n", encoding="utf-8")
+            seed_args = [str(seed_file)]
         command = [
             exe,
             str(project_root), "re",
             "-import", str(target),
-            "-postScript", "DumpAll.java", str(staged_out),
+            "-postScript", "DumpAll.java", str(staged_out), *seed_args,
             "-scriptPath", str(SCRIPT_DIR),
             "-deleteProject",
             "-analysisTimeoutPerFile", "600",
