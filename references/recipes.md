@@ -128,3 +128,53 @@ re serial -p COM11 --send "hex:01 03 00 00" --wait 1
 - 想知道某个字符串谁在用：`re strings -c 关键词` 拿偏移 → `re dis --at` 附近 → `re xref --at`
 - 想知道某地址在哪个函数：`re funcs` 找包含它的区间 → `re decompile --at` 该函数入口
 - 静态看不出所以然：`re chip --compare` + `re serial --listen`，先确认硬件那一半
+
+## 打一个跳板（改判定、改返回值）
+
+```powershell
+# 1) 先复制样本，别动原始文件
+Copy-Item .\目标.exe .\目标.副本.exe
+
+# 2) 写计划：在函数入口装 5 字节跳板，补丁代码 = mov eax,2; ret
+#    plan.json 内容（file 用副本的绝对路径）：
+#    {"file": "C:\\work\\目标.副本.exe",
+#     "ops": [{"kind": "detour", "at": "0x475224", "section": ".pwre",
+#              "code": "b802000000c3", "note": "判定恒返回 2"}]}
+
+# 3) 先演算，再落地
+re patch --plan .\plan.json --dry-run
+re patch --plan .\plan.json          # 必须看到「自检 通过」
+
+# 4) 复核：入口变成 jmp，洞里是补丁代码 + 被搬走的原指令
+re dis .\目标.副本.exe --at 0x475224 -n 3
+re dis .\目标.副本.exe --at 0x61b000 -n 4
+re pe  .\目标.副本.exe --json | Select-String '\.pwre'
+```
+
+判据：`re dis` 看到 `jmp section..pwre`、洞里有你的代码与 `E9` 回跳、`自检 通过`，才算打对。
+
+## 改过的 APK 重打包 + 重签
+
+```powershell
+# 1) 准备要替换的文件，相对路径与包内一致：替换目录\lib\arm64-v8a\libapp.so
+
+re repack in.apk -o out.apk -r .\替换目录 --sign --gen-key .\my.jks --ks-pass pass:123456 --key-alias re
+
+# 2) 必须看到「签名 v2,v3  校验=通过」
+re apk out.apk            # 复核包结构
+adb install -r -t out.apk # 上机
+```
+
+顺序不能反：先替换再签名；签完再替换等于没签。改过 `lib/*.so` 的包，v1/v2/v3 摘要全变，必须重签。
+
+## 动手前先判：该不该改客户端
+
+```powershell
+re gate 目标.apk                                # 静态信号：壳/框架/本地校验/付费墙/支付
+re gate 目标.apk --probe https://example.com/api/health   # 看接口是不是加密信封
+```
+
+- 判「客户端可改」→ 用 `re xref` 找到判定调用点，再 `re patch`。
+- 判「疑似服务端权威」→ 改客户端只能改显示；先找服务端下发的那条链路，或同内容的另一条接口。
+- 判「证据不足」→ 补抓包/运行时日志/调用栈，别硬改。
+

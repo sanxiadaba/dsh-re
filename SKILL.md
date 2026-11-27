@@ -40,6 +40,8 @@ re setup --ghidra    # 反编译（自动带 JDK）
 | 固件（.hex/.srec/.bin） | `re hex` 看段 → `re fw` 看向量表/入口 → `re funcs` → `re dis --at` → `re decompile --at`；要确认芯片里是不是这一版就 `re chip --compare` |
 | PE / ELF / DLL | `re pe` / `re elf` → `re strings` → `re funcs` → `re xref --at` → `re decompile --at` |
 | 安装包、asar、zip、APK、MSI、CAB | `re unpack` 摊开；APK 先 `re apk` 看包名/框架/壳/SDK 线索，再回到第 1 步 |
+| 要改二进制 / 重签 APK | `re patch --plan`（计划文件：改字节、加节、装 5 字节跳板）→ 打完 `re dis` 复核；APK 用 `re repack` 替换文件后 `--sign` 重签 |
+| 不确定"改了有没有用" | 先 `re gate 文件`：判定是客户端可改还是服务端权威，再决定要不要动手 |
 | 两个版本 | `re diff A B`，先看字节差异段，再看导入/节差异 |
 | 一堆报文 / 内存 / 进程 | `re proto`（离线分帧看字段）、`re mem`（进程/模块/内存 dump，Windows） |
 | 真硬件 | `re chip --info` 探测、`--compare` 比对、`--dump` 读回、`--flash --yes` 烧写；`re serial --loopback` 验串口接线 |
@@ -64,6 +66,9 @@ re setup --ghidra    # 反编译（自动带 JDK）
 | `re diff A B` | 两版差在哪 |
 | `re unpack 文件 [-o 目录]` | 剥包：zip/apk/jar/asar/tar/gz/xz/zst/cab/msi/pyinstaller、**UPX 壳的 PE** |
 | `re apk 文件` | APK 结构：包名/版本/权限/框架(Flutter/RN/Unity)/加固特征/原生库/SDK 线索 |
+| `re patch --plan p.json [--dry-run]` | 按计划改字节、加节、装 5 字节跳板；写完自检并逐条回报改了哪里 |
+| `re repack in.apk -o out.apk --sign …` | 重打包：替换条目、4 字节对齐、重签（v1/v2/v3）、校验；`--gen-key` 现场生成密钥 |
+| `re gate 文件 [--probe URL]` | 判定"客户端可改 / 疑似服务端权威 / 证据不足"，给信号与下一步 |
 | `re chip` | J-Link + SWD：`--info` 探测、`--dump` 读回、`--compare` 与固件比对、`--flash --yes` 烧写 |
 | `re serial` | 串口：`--list`、`--listen N`、`--loopback` 环回自检、`--send text:…/hex:…` |
 | `re mem` | 列进程、列模块、按地址 dump（Windows） |
@@ -83,5 +88,8 @@ re setup --ghidra    # 反编译（自动带 JDK）
 - **不硬来**：加壳文件跑 `re funcs` 会被拒绝；`re id` 会说出是哪种壳（UPX/ASPack/VMProtect…），
   UPX 直接 `re unpack` 就能脱，其它壳从内存 dump（`re mem`）。
 - **不特例**：不认识项目名、不认识芯片型号；一切从文件内容推。
+- **改前先判**：真要动二进制前先 `re gate`；它说"疑似服务端权威"时，改客户端只能改展示，不能改结果——先找服务端下发的那条链路。
+- **补丁只走计划文件**：所有改动写进 JSON 计划（可 diff、可重放），执行后必须看 `自检 通过`；`--dry-run` 先演算一遍。改的是副本，不要直接改原始样本。
+- **重签必须验**：`re repack --sign` 之后一定看 `校验=通过`；包内 `lib/*.so` 换过就必然要重签（v1/v2/v3 摘要全变）。
 
-细节参数见 `references/commands.md`，场景配方见 `references/recipes.md`。
+细节参数见 `references/commands.md`，场景配方见 `references/recipes.md`，判定树见 `references/gate.md`。

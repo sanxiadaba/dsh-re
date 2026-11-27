@@ -100,6 +100,7 @@ OPTIONAL = {
     "upx": "UPX 脱壳（re unpack 对 UPX 壳的 PE 直接调用它）",
     "apktool": "APK 反编译/回编译（re apk unpack 用，需要 java）",
     "jadx": "dex → Java 源码（re apk java 用）",
+    "buildtools": "APK 重签（apksigner/zipalign，re repack --sign 用）",
 }
 
 
@@ -129,6 +130,19 @@ def jadx_path() -> str | None:
         if candidate.is_file():
             return str(candidate)
     return _which("jadx")
+
+
+def buildtools_path() -> str | None:
+    """apksigner 的位置：engines/buildtools → 本机 build-tools → PATH。
+
+    repack 自己也会探测 ANDROID_HOME，这里只负责 doctor 展示与 re setup。
+    """
+    base = engines_dir() / "buildtools"
+    for name in ("apksigner.bat", "apksigner.exe", "apksigner"):
+        candidate = base / name
+        if candidate.is_file():
+            return str(candidate)
+    return _which("apksigner")
 
 
 def optional_status() -> list[dict]:
@@ -432,8 +446,13 @@ def setup(names) -> int:
                     install_java(needed)
             elif name == "java":
                 install_java()
+            elif name == "buildtools":
+                if buildtools_path():
+                    print(f"buildtools 已就位：{buildtools_path()}", file=sys.stderr)
+                else:
+                    install_buildtools()
             else:
-                raise ReError(f"不认识的引擎：{name}", hint="可用：rizin、ghidra、java")
+                raise ReError(f"不认识的引擎：{name}", hint="可用：rizin、ghidra、java、buildtools")
         except ReError as exc:
             failed += 1
             print(f"re: {exc.message}", file=sys.stderr)
@@ -443,6 +462,49 @@ def setup(names) -> int:
             failed += 1
             print(f"re: 安装 {name} 失败：{exc}", file=sys.stderr)
     return 1 if failed else 0
+
+
+BUILD_TOOLS_URL = "https://dl.google.com/android/repository/build-tools_r34-windows.zip"
+
+
+def install_buildtools() -> Path:
+    """下 Android build-tools（apksigner + zipalign）到 engines/buildtools。
+
+    只装 re repack --sign 真正用到的两件工具；解压后把含 apksigner 的那一层
+    整个搬到 engines/buildtools，repack 的探测路径就对得上。
+    """
+    import shutil
+    import zipfile
+
+    target = engines_dir() / "buildtools"
+    if buildtools_path():
+        return target
+    archive = download(BUILD_TOOLS_URL, engines_dir() / "_buildtools.zip", "Android build-tools 34")
+    staging = engines_dir() / "_buildtools_tmp"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(staging)
+        marker = next((p for p in staging.rglob("apksigner.bat")), None)
+        if marker is None:
+            marker = next((p for p in staging.rglob("apksigner")), None)
+        if marker is None:
+            raise ReError(
+                "build-tools 包里没找到 apksigner",
+                hint="换一个 build-tools 版本，或手工解压到 engines/buildtools",
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        for item in marker.parent.iterdir():
+            destination = target / item.name
+            if item.is_dir():
+                shutil.copytree(item, destination, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, destination)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+    return target
 
 
 def status() -> list[dict]:

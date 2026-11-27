@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import __version__, apk, armvec, chip, decompile, diff, disasm, engines, firmware, fwmap, mem, native, proto, scan, serialport, unpack
+from . import __version__, apk, armvec, chip, decompile, diff, disasm, engines, firmware, fwmap, gate, mem, native, patch, proto, repack, scan, serialport, unpack
 from .detect import FileInfo, entropy, packer_name, packed_reasons, sniff
 from .errors import ReError
 from .out import emit, human_size, warn
@@ -195,6 +195,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path")
     p.set_defaults(func=cmd_apk)
 
+    p = sub.add_parser("patch", help="打补丁：按计划改字节、加节、装 5 字节跳板")
+    p.add_argument("--plan", required=True, help="补丁计划 JSON（file + ops）")
+    p.add_argument("--dry-run", action="store_true", help="只演算，不写文件")
+    p.set_defaults(func=cmd_patch)
+
+    p = sub.add_parser("repack", help="重打包 APK：替换文件、对齐、重签、校验")
+    p.add_argument("src")
+    p.add_argument("-o", "--out", required=True, help="输出 APK 路径")
+    p.add_argument("-r", "--replace", default=None, help="替换目录（按相对路径覆盖包内同名条目）")
+    p.add_argument("--no-align", action="store_true", help="不做 4 字节对齐")
+    p.add_argument("--sign", action="store_true", help="重打包后重签")
+    p.add_argument("--keystore", default=None, help="已有 keystore（.jks/.keystore）")
+    p.add_argument("--ks-pass", default=None, help="keystore 口令")
+    p.add_argument("--key-alias", default=None, help="密钥别名")
+    p.add_argument("--key-pass", default=None, help="密钥口令（默认同 keystore 口令）")
+    p.add_argument("--gen-key", default=None, help="先用 keytool 生成密钥到这个路径，再签")
+    p.add_argument("--dname", default="CN=re, O=dsh-re, C=CN", help="--gen-key 的证书主题")
+    p.set_defaults(func=cmd_repack)
+
+    p = sub.add_parser("gate", help="判定：客户端可改，还是服务端权威")
+    p.add_argument("path")
+    p.add_argument("--probe", default=None, help="额外探测这个 URL（只看响应是不是加密信封）")
+    p.add_argument("--timeout", type=float, default=8.0, help="探测超时秒数（默认 8）")
+    p.set_defaults(func=cmd_gate)
+
     p = sub.add_parser("chip", help="真硬件：J-Link/SWD 探测、读回、比对、烧写")
     p.add_argument("path", nargs="?", default=None, help="固件文件（--compare/--flash 时给）")
     p.add_argument("--info", action="store_true", help="连上芯片读 CPUID 与向量表")
@@ -225,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rizin", action="store_true", help="反汇编引擎（re dis/funcs/xref 必需）")
     p.add_argument("--ghidra", action="store_true", help="反编译器（re decompile 必需，会自动带 JDK）")
     p.add_argument("--java", action="store_true", help="装 JDK（版本按 Ghidra 要求，当前 25）")
+    p.add_argument("--buildtools", action="store_true", help="装 Android build-tools（apksigner/zipalign）")
     p.add_argument("--all", action="store_true", help="装齐 java + rizin + ghidra")
     p.set_defaults(func=cmd_setup)
 
@@ -638,6 +664,125 @@ def cmd_apk(args):
     return 0
 
 
+# --------------------------------------------------------------- 改二进制
+
+
+def cmd_patch(args):
+    plan = patch.load_plan(Path(args.plan))
+    result = patch.apply_plan(plan, dry_run=args.dry_run)
+    target = Path(result["file"])
+    mark = "[干跑] " if args.dry_run else ""
+    lines = [
+        f"{mark}{target.name}  {result['size_before']:,} → {result['size_after']:,} 字节",
+    ]
+    for change in result["changes"]:
+        if change.get("superseded"):
+            continue
+        note = f"  {change['note']}" if change.get("note") else ""
+        lines.append(
+            f"  {change['kind']:<11} +0x{change['offset']:x} {change['length']}B  "
+            f"{change['before'] or '-'} → {change['after']}{note}"
+        )
+    for section in result["sections"]:
+        lines.append(
+            f"  节 {section['name']:<8} VA=0x{section['va']:x} vsize={section['vsize']} "
+            f"raw=0x{section['raw_offset']:x}+{section['raw_size']} ({section['status']})"
+        )
+    for warning in result.get("warnings", []):
+        warn(warning)
+    if not args.dry_run:
+        lines.append(f"自检 {'通过' if result['verify'] else '失败'}")
+    emit(args, lines, result)
+    if not (args.dry_run or result["verify"]):
+        raise ReError(
+            "补丁写回后自检不一致",
+            hint="文件可能被占用或写到一半；关掉占用进程后用副本重试",
+        )
+    return 0
+
+
+def cmd_repack(args):
+    src = Path(args.src)
+    dst = Path(args.out)
+    replace_dir = Path(args.replace) if args.replace else None
+    result = repack.repack(src, dst, replace_dir=replace_dir, align=not args.no_align)
+    lines = [
+        f"{src.name} → {dst.name}  {result['entries']} 条，{human_size(result['size'])}，"
+        f"对齐={result['alignment']}"
+    ]
+    if result["replaced"]:
+        lines.append("  替换 " + "、".join(result["replaced"]))
+    if result["unmatched"]:
+        warn("替换目录里这些文件在包里没有同名条目：" + "、".join(result["unmatched"]))
+    if result["duplicates"]:
+        warn("源包里重名条目（只写第一份）：" + "、".join(result["duplicates"]))
+    payload = {"repack": result}
+
+    if args.gen_key or args.sign:
+        if args.gen_key:
+            if not (args.ks_pass and args.key_alias):
+                raise ReError(
+                    "--gen-key 还要给 --ks-pass 和 --key-alias",
+                    hint="例：re repack in.apk -o out.apk --gen-key my.jks --ks-pass pass:123456 --key-alias re --sign",
+                )
+            generated = repack.gen_key(Path(args.gen_key), args.key_alias, args.ks_pass, args.dname)
+            lines.append(
+                f"生成密钥 {generated['keystore']}  alias={generated['alias']}  "
+                f"{human_size(generated['size'])}"
+            )
+            payload["gen_key"] = generated
+            keystore = Path(args.gen_key)
+        else:
+            if not args.keystore:
+                raise ReError(
+                    "--sign 要给 --keystore，或用 --gen-key 现场生成",
+                    hint="已有密钥：--keystore x.jks --ks-pass 口令 --key-alias 别名",
+                )
+            keystore = Path(args.keystore)
+        signed = repack.sign(dst, keystore, args.ks_pass or "", args.key_alias or "", args.key_pass)
+        checked = repack.verify(dst)
+        schemes = ",".join(checked["schemes"]) or "?"
+        lines.append(
+            f"签名 {schemes}  校验={'通过' if checked['ok'] else '失败'}  "
+            f"{checked['sha256'][:16]}"
+        )
+        payload["sign"] = signed
+        payload["verify"] = checked
+        if not checked["ok"]:
+            raise ReError(
+                "签名校验没通过",
+                hint="先看 apksigner 原始输出；口令/别名不对、APK 缺 AndroidManifest 都会走到这里",
+            )
+
+    emit(args, lines, payload)
+    return 0
+
+
+def cmd_gate(args):
+    result = gate.gate(Path(args.path), probe_url=args.probe, timeout=args.timeout)
+    verdict = {
+        "client_patchable": "客户端可改",
+        "server_authoritative": "疑似服务端权威",
+        "inconclusive": "证据不足",
+    }[result["verdict"]]
+    lines = [
+        f"{Path(args.path).name}  判定：{verdict}（置信度 {result['confidence']}）",
+    ]
+    for signal in result["signals"]:
+        if signal["name"] == "api_hosts":
+            lines.append(f"  {signal['weight']:+d} {signal['name']:<26} {signal['evidence']}")
+        else:
+            lines.append(f"  {signal['weight']:+d} {signal['name']:<26} {signal['evidence']}")
+    probe = result.get("probe")
+    if probe:
+        state = "ok" if probe.get("ok") else f"失败({probe.get('error') or probe.get('status')})"
+        lines.append(f"  探测 {probe['url']} → {state}")
+    for step in result["next_steps"]:
+        lines.append(f"  · {step}")
+    emit(args, lines, result)
+    return 0
+
+
 # --------------------------------------------------------------- 固件
 
 
@@ -873,11 +1018,11 @@ def cmd_setup(args):
     if args.all:
         names = ["java", "rizin", "ghidra"]
     else:
-        for name in ("rizin", "ghidra", "java"):
+        for name in ("rizin", "ghidra", "java", "buildtools"):
             if getattr(args, name):
                 names.append(name)
     if not names:
-        raise ReError("没说装什么", hint="用 --rizin / --ghidra / --all")
+        raise ReError("没说装什么", hint="用 --rizin / --ghidra / --java / --buildtools / --all")
     code = engines.setup(names)
     if code == 0:
         print("装好了。运行 `re doctor` 复核。")

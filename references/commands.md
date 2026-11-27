@@ -216,3 +216,55 @@ re setup --rizin --ghidra     # 可以一次给多个；--all = java + rizin + g
 都不进仓库、不进 PATH。
 `doctor` 会核对 JDK 版本与 Ghidra 要求（`application.java.min`），版本不够也计入"缺"。
 `setup` 的下载支持断点续传与重试，慢网/断流会保留 `.part` 下次接着下。
+
+## re patch
+
+```
+re patch --plan 补丁.json [--dry-run] [--json]
+```
+
+计划文件把改动写成数据，可 diff、可重放：
+
+```json
+{"file": "副本.exe",
+ "ops": [
+   {"kind": "patch", "offset": "0x43f766", "bytes": "ba 6a 57 00 00", "note": "改立即数"},
+   {"kind": "patch", "va": "0x14001ebe0", "bytes": "b801000000c3", "note": "按 VA 改"},
+   {"kind": "add_section", "name": ".pwre", "file": "cave.bin", "characteristics": "0x60000020"},
+   {"kind": "detour", "at": "0x475224", "section": ".pwre", "code": "b802000000c3", "note": "判定恒返回 2"}
+ ]}
+```
+
+- 只支持 PE / PE32+。`offset` 与 `va` 二选一（都给按 offset），`va` 是**绝对地址**（ImageBase+RVA）。
+- `add_section` 追加到文件尾，同步 `NumberOfSections` / `SizeOfImage` / 节表项；头部放不下第 n+1 个节表项会直接报错。
+- `detour` 在 `at` 写 `E9 rel32`，把被覆盖的完整指令（用 capstone 找到 ≥5 字节边界）搬进洞，
+  洞布局是 `code → 原始指令 → E9 回跳 at+N`，`at+5..at+N` 填 NOP。
+- 全部改动先落内存、一次原子写回，然后重读逐条自检；`自检 通过` 才算完。
+- `--dry-run` 只演算不落盘，`changes` 与真实执行逐条一致。
+- 不支持：ARM64 跳板、RIP 相对指令的重定位、CheckSum/AuthentiCode（改了签名必然失效）。
+
+## re repack
+
+```
+re repack in.apk -o out.apk [-r 替换目录] [--no-align] [--sign \
+    --keystore x.jks --ks-pass pass:… --key-alias … [--key-pass …] | --gen-key x.jks …] [--json]
+```
+
+- `-r/--replace 目录`：按相对路径替换包内同名条目（`替换目录/lib/arm64-v8a/libapp.so` → `lib/arm64-v8a/libapp.so`）；
+  没命中的替换文件会列出来，不静默丢弃。重名条目只写第一份。
+- 对齐：有 `zipalign` 用 `zipalign -f -p 4`，没有就内置把未压缩条目按 4 字节对齐（不保证 `.so` 页对齐）。
+- `--sign`：`apksigner` 探测顺序 engines/buildtools → `ANDROID_HOME`/`ANDROID_SDK_ROOT` 的 build-tools（取最高版本）→ `PATH`；
+  找不到会直接报错并给安装命令（`re setup --buildtools`）。`--gen-key` 用 keytool 现场生成（不覆盖已有 keystore）。
+- 口令里有 `"`、`%`、`&` 时，有 `lib/apksigner.jar` + java 会直接走 `java -jar`，绕过 `.bat` 的 cmd 转义。
+- 重打包必然让 v1/v2/v3 摘要失效，所以"改包 + 不重签"没有意义。
+
+## re gate
+
+```
+re gate 文件 [--probe https://…] [--timeout 8] [--json]
+```
+
+输出判定（`客户端可改` / `疑似服务端权威` / `证据不足`）、置信度、逐条信号（带权重与证据）、下一步建议。
+静态信号来自壳/框架/本地校验/付费墙模型/支付串/明文主机；`--probe` 只发一次 GET，看响应是不是加密信封
+（`"hash": true`、长 base64、`items` 明文列表、401/403），失败不抛异常。
+判定树与实战对照见 `references/gate.md`。
