@@ -244,7 +244,7 @@ class ToolTests(unittest.TestCase):
                 with self.assertRaises(ReError) as caught:
                     repack.sign(root / "app.apk", root / "key.jks", "pass1234", "re")
         self.assertEqual(str(caught.exception), "找不到 apksigner")
-        self.assertEqual(caught.exception.hint, "装 Android build-tools，或把 build-tools 放进 PATH")
+        self.assertIn("re setup --buildtools", caught.exception.hint)
 
     def test_sign_argv_keeps_special_password_in_one_element(self):
         argv = repack._sign_argv(

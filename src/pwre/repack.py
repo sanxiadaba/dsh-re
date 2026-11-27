@@ -2,7 +2,7 @@
 
 `repack()` 只管 zip 层；`sign()` / `verify()` / `gen_key()` 把 Android
 build-tools 的 apksigner 和 JDK 的 keytool 串起来。四个入口都是纯函数，
-不碰 argparse；CLI 接线（`re repack` / `re sign` / `re verify`）留给 cli.py。
+不碰 argparse；CLI 只暴露 `re repack`（`--sign` / `--gen-key` 是它的开关）。
 
 对齐的判定对象是**条目数据区**：`ZipInfo.header_offset` 是 local header 的
 起点，数据起点还要加上 30 字节固定头、文件名和 extra 字段。zipalign 保证的
@@ -24,7 +24,7 @@ from .errors import ReError
 
 _APKSIGNER_NAMES = ("apksigner.bat", "apksigner.exe", "apksigner.cmd", "apksigner")
 _ZIPALIGN_NAMES = ("zipalign.exe", "zipalign.bat", "zipalign.cmd", "zipalign")
-_APKSIGNER_HINT = "装 Android build-tools，或把 build-tools 放进 PATH"
+_APKSIGNER_HINT = "跑 re setup --buildtools（或设 ANDROID_HOME 指向装有 build-tools 的 SDK）"
 _KEYTOOL_HINT = "装 JDK（keytool 在 JDK 的 bin 里），或把包含 keytool 的目录放进 PATH"
 
 
@@ -532,6 +532,7 @@ def _sign_argv(
         "--v1-signing-enabled", "true" if v1 else "false",
         "--v2-signing-enabled", "true" if v2 else "false",
         "--v3-signing-enabled", "true" if v3 else "false",
+        "--v4-signing-enabled", "false",  # v4 会留下孤儿 .idsig，且我们不做增量安装
         "--out", str(out),
         str(apk),
     ]

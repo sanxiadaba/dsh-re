@@ -228,14 +228,14 @@ re patch --plan 补丁.json [--dry-run] [--json]
 ```json
 {"file": "副本.exe",
  "ops": [
-   {"kind": "patch", "offset": "0x43f766", "bytes": "ba 6a 57 00 00", "note": "改立即数"},
+   {"kind": "patch", "va": "0x43f766", "bytes": "ba 6a 57 00 00", "note": "改立即数（VA 不是文件偏移）"},
    {"kind": "patch", "va": "0x14001ebe0", "bytes": "b801000000c3", "note": "按 VA 改"},
    {"kind": "add_section", "name": ".pwre", "file": "cave.bin", "characteristics": "0x60000020"},
    {"kind": "detour", "at": "0x475224", "section": ".pwre", "code": "b802000000c3", "note": "判定恒返回 2"}
  ]}
 ```
 
-- 只支持 PE / PE32+。`offset` 与 `va` 二选一（都给按 offset），`va` 是**绝对地址**（ImageBase+RVA）。
+- 支持 PE / PE32+（add_section/detour）与 ELF（只支持 patch，按 offset/va 改字节，Android 的 .so 就走这条）。`offset` 与 `va` 二选一（都给按 offset），`va` 是**绝对地址**（ImageBase+RVA）。
 - `add_section` 追加到文件尾，同步 `NumberOfSections` / `SizeOfImage` / 节表项；头部放不下第 n+1 个节表项会直接报错。
 - `detour` 在 `at` 写 `E9 rel32`，把被覆盖的完整指令（用 capstone 找到 ≥5 字节边界）搬进洞，
   洞布局是 `code → 原始指令 → E9 回跳 at+N`，`at+5..at+N` 填 NOP。

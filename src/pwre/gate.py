@@ -351,17 +351,23 @@ def _binary_signals(path: Path) -> list[dict]:
             f"命中授权/许可痕迹：{_found_text(license_hits)}；可能联网校验，也可能只是本地判断",
         ))
 
+    weak_local = False
     if local_hits:
+        # 只命中一处时多半是无关字符串（libcurl 里就有 "not registered"、
+        # "SEC_E_CERT_EXPIRED" 这种），不能当"本地授权标志位"的铁证。
+        weak_local = len(local_hits) < 2
         signals.append(_signal(
-            "local_flag_check",
-            -3,
+            "local_flag_hint" if weak_local else "local_flag_check",
+            -1 if weak_local else -3,
             f"命中本地授权标志位比较痕迹：{_found_text(local_hits)}；"
-            "如果授权只比标志位，客户端侧可直接改（仍需确认资源/服务端约束）",
+            + ("只有一处，可能是无关字符串，需要 xref/反编译确认"
+               if weak_local
+               else "如果授权只比标志位，客户端侧可直接改（仍需确认资源/服务端约束）"),
         ))
 
-    # 验签 + 本地标志位同时存在：验签结果最后落在本地标志上，改标志即可绕过
+    # 验签 + 多处本地标志位同时存在：验签结果最后落在本地标志上，改标志即可绕过
     # （VOFA+ 与 UartAssist 都是这个形状：RSA 验签失败会清标志，但标志本身可被改写）
-    if has_key and verify_hits and local_hits:
+    if has_key and verify_hits and local_hits and not weak_local:
         signals.append(_signal(
             "flag_overrides_signature",
             -2,
@@ -540,9 +546,18 @@ def gate(path: Path, probe_url: str | None = None, timeout: float = 8.0) -> dict
         signals.extend(probe["signals"])
 
     score = sum(item["weight"] for item in signals)
-    if score >= 3:
+    # 只有"结构性证据"才敢下结论：壳/框架/完整性校验/真实探测。
+    # 纯字符串共现（尤其 curl.exe 里 libcurl 的 "not registered"）不算。
+    structural = any(item["name"] in {
+        "packer", "framework", "local_integrity", "signed_license_check",
+        "probe_encrypted_envelope", "probe_plaintext_json", "probe_auth_required",
+    } for item in signals)
+    local_only = any(item["name"] == "local_flag_check" for item in signals)
+    pure_local = local_only and not any(item["name"] in {"signed_license_check", "hardcoded_public_key"}
+                         for item in signals) and local_only
+    if structural and score >= 3:
         verdict = "server_authoritative"
-    elif score <= -2:
+    elif (structural or pure_local) and score <= -2:
         verdict = "client_patchable"
     else:
         verdict = "inconclusive"

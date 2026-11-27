@@ -133,15 +133,28 @@ def jadx_path() -> str | None:
 
 
 def buildtools_path() -> str | None:
-    """apksigner 的位置：engines/buildtools → 本机 build-tools → PATH。
+    """apksigner 的位置：engines/buildtools → 本机 SDK 的 build-tools → PATH。
 
-    repack 自己也会探测 ANDROID_HOME，这里只负责 doctor 展示与 re setup。
+    必须和 repack.apksigner_path() 认同一批位置，否则 re doctor 说"缺失"、
+    re repack --sign 却能签，用户会被误导。
     """
     base = engines_dir() / "buildtools"
     for name in ("apksigner.bat", "apksigner.exe", "apksigner"):
         candidate = base / name
         if candidate.is_file():
             return str(candidate)
+    for key in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        root = os.environ.get(key)
+        if not root:
+            continue
+        build_tools = Path(root) / "build-tools"
+        if not build_tools.is_dir():
+            continue
+        for version in sorted(build_tools.iterdir(), key=lambda item: item.name, reverse=True):
+            for name in ("apksigner.bat", "apksigner.exe", "apksigner"):
+                candidate = version / name
+                if candidate.is_file():
+                    return str(candidate)
     return _which("apksigner")
 
 

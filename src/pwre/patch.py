@@ -578,19 +578,41 @@ def _op_add_section(state: _State, op: dict, where: str) -> None:
         )
     payload = _section_payload(op, where, state)
     characteristics = DEFAULT_CHARACTERISTICS
-    if op.get("characteristics") is not None:
-        characteristics = _int(op["characteristics"], f"{where}.characteristics")
+    raw_flags = op.get("characteristics")
+    if raw_flags is None:
+        raw_flags = op.get("section_characteristics")
+    if raw_flags is not None:
+        characteristics = _int(raw_flags, f"{where}.characteristics")
         if not 0 <= characteristics <= 0xFFFFFFFF:
             raise ReError(
                 f"{where}.characteristics 超出 32 位：{characteristics}",
                 hint="照规范写 0x60000020（代码可执行可读）之类的 32 位值",
             )
-    elif op.get("section_characteristics") is not None:
-        characteristics = _int(op["section_characteristics"], f"{where}.section_characteristics")
     if not characteristics & MEM_EXECUTE:
         state.warn(f"{where} 新建的节 {text} 没有执行权限（0x{characteristics:08x}），放代码不会被执行")
     layout = image.plan_section(name_bytes, payload, characteristics, where=where)
     image.commit_section(layout, state)
+
+
+def _is_instruction_boundary(image: _Image, at_offset: int, at_va: int) -> bool:
+    """at 是不是真实指令边界。
+
+    做法：从 at-1..at-4 各解一条指令，只要有一条指令跨过 at（起点 < at < 起点+长度），
+    就判"不是边界"——宁可让用户显式加 allow_unaligned，也不要静默产出会崩的二进制。
+    """
+    md = Cs(CS_ARCH_X86, CS_MODE_64 if image.bits == 64 else CS_MODE_32)
+    for back in (1, 2, 3, 4):
+        start = at_offset - back
+        if start < 0:
+            continue
+        chunk = bytes(image.data[start:start + 16])
+        if not chunk:
+            continue
+        for insn in md.disasm(chunk, at_va - back):
+            if insn.address + insn.size > at_va:
+                return False
+            break
+    return True
 
 
 def _reloc_len(image: _Image, at_offset: int, at_va: int) -> tuple[int, list]:
@@ -624,6 +646,61 @@ def _rel32(instr_va: int, target_va: int, what: str) -> bytes:
     return struct.pack("<i", delta)
 
 
+def _rel_branch(raw: bytearray) -> tuple[int, int] | None:
+    """识别 x86 相对分支指令，返回 (位移字段宽度, 字段偏移)。"""
+    if not raw:
+        return None
+    op = raw[0]
+    if op in (0xE8, 0xE9):
+        return (4, 1)
+    if op == 0xEB or 0x70 <= op <= 0x7F or 0xE0 <= op <= 0xE3:
+        return (1, 1)
+    if op == 0x0F and len(raw) >= 2 and 0x80 <= raw[1] <= 0x8F:
+        return (4, 2)
+    return None
+
+
+def _relocate(insns, dest_va: int, where: str, allow_unaligned: bool) -> bytes:
+    """按新地址重写要搬运的指令：相对分支重算位移，RIP 相对寻址直接拒绝。
+
+    今晚踩过的坑：把 `call rel32` 原样搬进洞，目标会指向洞里的错误位置，
+    而 `自检 通过` 只证明磁盘字节和内存镜像一致，证不了语义没变。
+    """
+    out = bytearray()
+    for insn in insns:
+        raw = bytearray(insn.bytes)
+        new_va = dest_va + len(out)
+        if any(operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP
+               for operand in insn.operands):
+            if not allow_unaligned:
+                raise ReError(
+                    f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）用了 RIP 相对寻址，"
+                    "搬到代码洞后语义会变",
+                    hint="换一个 detour 点，避开这种指令；"
+                         "或者手工重写这条指令、把整段写成 op 的 code",
+                )
+            out += raw
+            continue
+        spec = _rel_branch(raw)
+        if spec is None:
+            out += raw
+            continue
+        width, field_off = spec
+        old_rel = int.from_bytes(raw[field_off:field_off + width], "little", signed=True)
+        target = insn.address + insn.size + old_rel
+        new_rel = target - (new_va + insn.size)
+        low, high = (-(1 << 7), 1 << 7) if width == 1 else (-(1 << 31), 1 << 31)
+        if not low <= new_rel < high:
+            raise ReError(
+                f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）是相对跳转，"
+                f"搬到代码洞后位移 {new_rel} 超出 {width * 8} 位",
+                hint="把补丁节放得离代码更近，或换一个不含 call/jmp/jcc 的 detour 点",
+            )
+        raw[field_off:field_off + width] = new_rel.to_bytes(width, "little", signed=True)
+        out += raw
+    return bytes(out)
+
+
 def _op_detour(state: _State, op: dict, where: str) -> None:
     image = state.image
     at = _int(op.get("at"), f"{where}.at")
@@ -632,10 +709,17 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
         raw_code = op.get("bytes")       # 允许把补丁代码写成 bytes
     code = _hex_bytes(raw_code, f"{where}.code")
     note = str(op.get("note") or "")
+    allow_unaligned = bool(op.get("allow_unaligned"))
     at_offset = image.va_to_offset(at, JUMP_SIZE)
     section = image.section_by_va(at)
     if section and not section["characteristics"] & MEM_EXECUTE:
         state.warn(f"{where} 的 at {at:#x} 落在不可执行的节 {section['name']} 里，跳板写进去也不会被执行")
+    if not allow_unaligned and not _is_instruction_boundary(image, at_offset, at):
+        raise ReError(
+            f"{where} 的 at {at:#x} 不像指令边界（从 at-1..at-4 解码时有指令跨过它）",
+            hint="换个落点：函数入口或 re dis 里看到的指令起始地址；"
+                 "确实要从指令中间打，在 op 里加 \"allow_unaligned\": true",
+        )
     n, insns = _reloc_len(image, at_offset, at)
     original = bytes(image.data[at_offset:at_offset + n])
 
@@ -646,7 +730,8 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
     cave_va = slot["va"]
     back_va = at + n
     back_instr = cave_va + len(code) + n
-    stub = code + original + b"\xe9" + _rel32(back_instr, back_va, f"{where} 的回跳")
+    moved = _relocate(insns, cave_va + len(code), where, allow_unaligned)
+    stub = code + moved + b"\xe9" + _rel32(back_instr, back_va, f"{where} 的回跳")
 
     if slot["offset"] < at_offset + n and at_offset < slot["offset"] + len(stub):
         raise ReError(
@@ -662,13 +747,14 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
         va=cave_va, cave_va=cave_va, n=n,
     ))
 
-    for insn in insns:
-        if any(operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP
-               for operand in insn.operands):
-            state.warn(
-                f"{where}：{insn.address:#x} 的 {insn.mnemonic} 用了 RIP 相对寻址，"
-                f"搬到 {cave_va:#x} 后语义会变；建议换 detour 点或手动修正这条指令"
-            )
+    if allow_unaligned:
+        for insn in insns:
+            if any(operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP
+                   for operand in insn.operands):
+                state.warn(
+                    f"{where}：{insn.address:#x} 的 {insn.mnemonic} 用了 RIP 相对寻址，"
+                    f"搬到 {cave_va:#x} 后语义会变；建议换 detour 点或手动修正这条指令"
+                )
 
     before_at = bytes(image.data[at_offset:at_offset + n])
     jump = b"\xe9" + _rel32(at, cave_va, f"{where} 的前跳") + b"\x90" * (n - JUMP_SIZE)
@@ -830,6 +916,102 @@ def _resolve_op(base: Path, op: dict) -> dict:
     return op
 
 
+def _elf_va_to_offset(raw: bytes, va: int, size: int) -> int:
+    """ELF 的 VA → 文件偏移（按 PT_LOAD 的 p_vaddr/p_filesz/p_offset 映射）。"""
+    import io
+
+    from elftools.elf.elffile import ELFFile
+
+    with ELFFile(io.BytesIO(raw)) as elf:
+        for segment in elf.iter_segments():
+            if segment["p_type"] != "PT_LOAD":
+                continue
+            start = int(segment["p_vaddr"])
+            if start <= va and va + size <= start + int(segment["p_filesz"]):
+                return int(segment["p_offset"]) + (va - start)
+    raise ReError(
+        f"VA {va:#x}（{size} 字节）不在任何 PT_LOAD 段里",
+        hint="ELF 的地址要落在有文件内容的段内；先 re elf 看段的 vaddr/file size，"
+             "或者干脆用 offset（文件偏移）写",
+    )
+
+
+def _apply_elf(target: Path, raw: bytes, ops: list, dry_run: bool) -> dict:
+    """ELF（含 Android 的 .so）只支持按 offset/va 改字节。
+
+    APK 里的补丁绝大多数是这种：在 libapp.so / libxxx.so 里把某个函数改成
+    mov w0,#1; ret（ARM64 是 `20 00 80 52 c0 03 5f d6`）。PE 那套加节/跳板对
+    ELF 不适用——没有节表、也不能随便挪段。
+    """
+    data = bytearray(raw)
+    changes: list[dict] = []
+    warnings: list[str] = []
+    for index, op in enumerate(ops):
+        where = f"ops[{index}]"
+        if not isinstance(op, dict):
+            raise ReError(
+                f"{where} 不是对象",
+                hint='每条操作是一个 JSON 对象，形如 {"kind": "patch", "offset": "0x100", "bytes": "90"}',
+            )
+        kind = op.get("kind")
+        if kind != "patch":
+            raise ReError(
+                f"{where} 的 kind 是 {kind!r}，ELF 只支持 patch",
+                hint="ELF 没有 PE 节表；要加节/装跳板请对 PE 用 add_section/detour",
+            )
+        payload = _hex_bytes(op.get("bytes"), f"{where}.bytes")
+        if not payload:
+            raise ReError(
+                f"{where}.bytes 是空的",
+                hint="至少写一个字节，例如 \"c0035fd6\"（ret）",
+            )
+        va = None
+        if op.get("offset") is not None:
+            offset = _int(op["offset"], f"{where}.offset")
+            if op.get("va") is not None:
+                warnings.append(f"{where} 同时给了 offset 和 va，按 offset 处理（偏移优先）")
+        elif op.get("va") is not None:
+            va = _int(op["va"], f"{where}.va")
+            offset = _elf_va_to_offset(raw, va, len(payload))
+        else:
+            raise ReError(
+                f"{where} 需要 offset 或 va 之一",
+                hint="写文件偏移用 \"offset\"；写虚拟地址用 \"va\"（先 re elf 看段表）",
+            )
+        if offset < 0 or offset + len(payload) > len(data):
+            raise ReError(
+                f"{where} 越界：offset {offset:#x} + {len(payload)} 字节超出文件大小 {len(data):#x}",
+                hint="检查 offset：ELF 的文件偏移和虚拟地址通常不相等（差一个段偏移）",
+            )
+        before = bytes(data[offset:offset + len(payload)])
+        data[offset:offset + len(payload)] = payload
+        changes.append(_change("patch", "patch", offset, before, payload,
+                               str(op.get("note") or ""), va=va))
+
+    result = {
+        "ok": True,
+        "file": str(target),
+        "dry_run": bool(dry_run),
+        "format": "elf",
+        "size_before": len(raw),
+        "size_after": len(data),
+        "changes": changes,
+        "sections": [],
+        "warnings": warnings,
+        "verify": True,
+    }
+    if dry_run:
+        return result
+    _write_atomic(target, bytes(data))
+    verify, problems = _verify(target, bytes(data), changes)
+    result["verify"] = verify
+    result["ok"] = verify
+    if not verify:
+        result["errors"] = problems
+        result["hint"] = "文件已写入但自检不一致：先用备份恢复，再逐条查 plan"
+    return result
+
+
 def apply_plan(plan: dict, dry_run: bool = False) -> dict:
     """执行一份补丁计划。
 
@@ -840,6 +1022,8 @@ def apply_plan(plan: dict, dry_run: bool = False) -> dict:
     """
     target, ops = _plan_parts(plan)
     raw = _read_target(target)
+    if raw[:4] == b"\x7fELF":
+        return _apply_elf(target, raw, ops, dry_run)
     image = _Image(raw)
     state = _State(image)
     for index, op in enumerate(ops):
