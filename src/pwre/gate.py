@@ -552,12 +552,9 @@ def gate(path: Path, probe_url: str | None = None, timeout: float = 8.0) -> dict
         "packer", "framework", "local_integrity", "signed_license_check",
         "probe_encrypted_envelope", "probe_plaintext_json", "probe_auth_required",
     } for item in signals)
-    local_only = any(item["name"] == "local_flag_check" for item in signals)
-    pure_local = local_only and not any(item["name"] in {"signed_license_check", "hardcoded_public_key"}
-                         for item in signals) and local_only
     if structural and score >= 3:
         verdict = "server_authoritative"
-    elif (structural or pure_local) and score <= -2:
+    elif structural and score <= -2:
         verdict = "client_patchable"
     else:
         verdict = "inconclusive"

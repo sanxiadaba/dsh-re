@@ -601,18 +601,15 @@ def _is_instruction_boundary(image: _Image, at_offset: int, at_va: int) -> bool:
     就判"不是边界"——宁可让用户显式加 allow_unaligned，也不要静默产出会崩的二进制。
     """
     md = Cs(CS_ARCH_X86, CS_MODE_64 if image.bits == 64 else CS_MODE_32)
-    for back in (1, 2, 3, 4):
-        start = at_offset - back
-        if start < 0:
-            continue
-        chunk = bytes(image.data[start:start + 16])
-        if not chunk:
-            continue
-        for insn in md.disasm(chunk, at_va - back):
-            if insn.address + insn.size > at_va:
-                return False
-            break
-    return True
+    start = max(0, at_offset - 15)          # x86 单条指令最长 15 字节
+    chunk = bytes(image.data[start:at_offset])
+    if not chunk:
+        return True                          # 文件开头，没有前置指令可比
+    base_va = at_va - (at_offset - start)
+    for insn in md.disasm(chunk, base_va):
+        if insn.address + insn.size == at_va:
+            return True
+    return False
 
 
 def _reloc_len(image: _Image, at_offset: int, at_va: int) -> tuple[int, list]:
@@ -714,13 +711,19 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
     section = image.section_by_va(at)
     if section and not section["characteristics"] & MEM_EXECUTE:
         state.warn(f"{where} 的 at {at:#x} 落在不可执行的节 {section['name']} 里，跳板写进去也不会被执行")
-    if not allow_unaligned and not _is_instruction_boundary(image, at_offset, at):
+    boundary_ok = _is_instruction_boundary(image, at_offset, at)
+    if allow_unaligned and not boundary_ok:
+        state.warn(
+            f"{where}：at {at:#x} 落在指令中间（已按要求放行）；产物很可能在运行时崩溃，跑之前先备份"
+        )
+    if not allow_unaligned and not boundary_ok:
         raise ReError(
             f"{where} 的 at {at:#x} 不像指令边界（从 at-1..at-4 解码时有指令跨过它）",
             hint="换个落点：函数入口或 re dis 里看到的指令起始地址；"
                  "确实要从指令中间打，在 op 里加 \"allow_unaligned\": true",
         )
     n, insns = _reloc_len(image, at_offset, at)
+    image.va_to_offset(at, n)      # 按实际覆盖长度再验一次：不能写穿节尾/文件尾
     original = bytes(image.data[at_offset:at_offset + n])
 
     cave_name = op.get("section") or DEFAULT_CAVE

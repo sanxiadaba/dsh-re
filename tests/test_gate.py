@@ -181,6 +181,22 @@ class BinaryVerdictTests(unittest.TestCase):
         result = gate(path)
         names = {item["name"] for item in result["signals"]}
         self.assertIn("local_flag_check", names)
+        # 纯字符串共现只算线索：没有结构性证据（壳/框架/完整性/验签/探测）不下结论。
+        # 实战教训：curl.exe 里有 "not registered"、winlogon.exe 里有 "licensestatus"。
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertTrue(result["next_steps"])
+
+    def test_pe_with_signature_and_two_local_markers_is_client(self):
+        path = Path(self._tmp.name) / "licensed.exe"
+        path.write_bytes(
+            b"MZ" + b"\x00" * 256
+            + b"-----BEGIN PUBLIC KEY-----\x00RSA_public_decrypt\x00"
+            + b"isLicensed\x00registered\x00trial\x00"
+        )
+        result = gate(path)
+        names = {item["name"] for item in result["signals"]}
+        self.assertIn("signed_license_check", names)
+        self.assertIn("flag_overrides_signature", names)
         self.assertEqual(result["verdict"], "client_patchable")
 
     def test_elf_kind_is_detected(self):
