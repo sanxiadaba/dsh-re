@@ -175,6 +175,26 @@ class _Image:
         self.data = bytearray(data)
         self.pe = _parse_pe(bytes(self.data))
 
+    def boundary_set(self, section) -> set[int]:
+        """这一节里所有指令起始 VA：从节首线性扫一遍（比 at-15 猜边界可靠）。
+
+        只扫有文件内容的范围 min(vsize, raw_size)；结果按节缓存，detour 多条计划
+        也只付一次成本。
+        """
+        cache = getattr(self, "_bounds_cache", None)
+        if cache is None:
+            cache = self._bounds_cache = {}
+        key = section["name"]
+        if key in cache:
+            return cache[key]
+        start = section["va"]
+        size = min(section["vsize"], section["raw_size"]) or section["vsize"]
+        chunk = bytes(self.data[section["raw_offset"]:section["raw_offset"] + size])
+        md = Cs(CS_ARCH_X86, CS_MODE_64 if self.bits == 64 else CS_MODE_32)
+        starts = {insn.address for insn in md.disasm(chunk, start)}
+        cache[key] = starts
+        return starts
+
     # ---- 基本信息 ------------------------------------------------------
     def refresh(self) -> None:
         self.pe = _parse_pe(bytes(self.data))
@@ -600,16 +620,10 @@ def _is_instruction_boundary(image: _Image, at_offset: int, at_va: int) -> bool:
     做法：从 at-1..at-4 各解一条指令，只要有一条指令跨过 at（起点 < at < 起点+长度），
     就判"不是边界"——宁可让用户显式加 allow_unaligned，也不要静默产出会崩的二进制。
     """
-    md = Cs(CS_ARCH_X86, CS_MODE_64 if image.bits == 64 else CS_MODE_32)
-    start = max(0, at_offset - 15)          # x86 单条指令最长 15 字节
-    chunk = bytes(image.data[start:at_offset])
-    if not chunk:
-        return True                          # 文件开头，没有前置指令可比
-    base_va = at_va - (at_offset - start)
-    for insn in md.disasm(chunk, base_va):
-        if insn.address + insn.size == at_va:
-            return True
-    return False
+    section = image.section_by_va(at_va)
+    if not section:
+        return False                         # 不在任何节里，不能当代码落点
+    return at_va in image.boundary_set(section)
 
 
 def _reloc_len(image: _Image, at_offset: int, at_va: int) -> tuple[int, list]:
@@ -712,15 +726,21 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
     if section and not section["characteristics"] & MEM_EXECUTE:
         state.warn(f"{where} 的 at {at:#x} 落在不可执行的节 {section['name']} 里，跳板写进去也不会被执行")
     boundary_ok = _is_instruction_boundary(image, at_offset, at)
+    verified = bool(op.get("verified_boundary"))
+    if not boundary_ok and not verified and not allow_unaligned:
+        raise ReError(
+            f"{where} 的 at {at:#x} 没有被识别成指令边界（本节线性反汇编里没有它）",
+            hint="先用 `re dis 文件 --at 0x… -n 5` 确认这是指令起始地址；"
+                 "确认无误后在 op 里加 \"verified_boundary\": true；"
+                 "确实要打在指令中间就加 \"allow_unaligned\": true（会警告，产物可能崩）",
+        )
     if allow_unaligned and not boundary_ok:
         state.warn(
             f"{where}：at {at:#x} 落在指令中间（已按要求放行）；产物很可能在运行时崩溃，跑之前先备份"
         )
-    if not allow_unaligned and not boundary_ok:
-        raise ReError(
-            f"{where} 的 at {at:#x} 不像指令边界（从 at-1..at-4 解码时有指令跨过它）",
-            hint="换个落点：函数入口或 re dis 里看到的指令起始地址；"
-                 "确实要从指令中间打，在 op 里加 \"allow_unaligned\": true",
+    elif verified and not boundary_ok:
+        state.warn(
+            f"{where}：at {at:#x} 是人工确认过的边界（自动判定不认它）；改完务必用 re dis 复核"
         )
     n, insns = _reloc_len(image, at_offset, at)
     image.va_to_offset(at, n)      # 按实际覆盖长度再验一次：不能写穿节尾/文件尾
