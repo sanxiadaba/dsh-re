@@ -268,3 +268,15 @@ re gate 文件 [--probe https://…] [--timeout 8] [--json]
 静态信号来自壳/框架/本地校验/付费墙模型/支付串/明文主机；`--probe` 只发一次 GET，看响应是不是加密信封
 （`"hash": true`、长 base64、`items` 明文列表、401/403），失败不抛异常。
 判定树与实战对照见 `references/gate.md`。
+
+### patch 的实现细节与边界（踩过的坑）
+
+- **落点判定**：先用 rizin 深分析（`aaa`）拿函数区间，再在每个函数内部用 capstone 线性解码，
+  得到"指令起始 VA 集合"；`at` 不在集合里就拒绝。整节盲扫会在数据岛处失步（curl.exe 的 `.text`
+  就是这种），所以只作兜底。
+- **人工确认逃生门**：自动判定不认、但你用 `re dis --at` 确认过是边界的，加 `"verified_boundary": true`；
+  确实要打在指令中间才用 `"allow_unaligned": true`（会写进 warnings，产物可能崩）。
+- **重定位**：`call/jmp rel32` 重算位移；`jcc/jmp rel8` 放宽成 `0F 8x` / `E9`；RIP 相对内存操作数
+  重算 disp32；`loop/jrcxz` 没有宽编码，直接拒绝。
+- **已知限制**：超过 8MB 的二进制只用 `aa`（函数覆盖少，拒绝率会升高）；ELF 不支持 detour；
+  不更新 CheckSum / Authenticode（改过签名必然失效）。

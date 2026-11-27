@@ -36,6 +36,7 @@ import json
 import os
 import re
 import struct
+import subprocess
 from pathlib import Path
 
 import pefile
@@ -176,10 +177,11 @@ class _Image:
         self.pe = _parse_pe(bytes(self.data))
 
     def boundary_set(self, section) -> set[int]:
-        """这一节里所有指令起始 VA：从节首线性扫一遍（比 at-15 猜边界可靠）。
+        """这一节里所有指令起始 VA。
 
-        只扫有文件内容的范围 min(vsize, raw_size)；结果按节缓存，detour 多条计划
-        也只付一次成本。
+        先用 rizin 把函数区间分析出来（aa; aflj），再在每个函数内部用 capstone
+        线性解码——函数起点是可靠锚点，避免整节盲扫在数据岛处失步（curl.exe 的
+        .text 就是这种）。rizin 不可用或没分析出函数时退回整节线性扫。
         """
         cache = getattr(self, "_bounds_cache", None)
         if cache is None:
@@ -187,11 +189,26 @@ class _Image:
         key = section["name"]
         if key in cache:
             return cache[key]
-        start = section["va"]
-        size = min(section["vsize"], section["raw_size"]) or section["vsize"]
-        chunk = bytes(self.data[section["raw_offset"]:section["raw_offset"] + size])
+
+        lo = section["va"]
+        hi = lo + max(section["vsize"], section["raw_size"])
         md = Cs(CS_ARCH_X86, CS_MODE_64 if self.bits == 64 else CS_MODE_32)
-        starts = {insn.address for insn in md.disasm(chunk, start)}
+        starts: set[int] = set()
+
+        source = getattr(self, "source_path", None)
+        if source:
+            for fva, fsize in _rizin_function_ranges(Path(str(source))):
+                if not (lo <= fva < hi):
+                    continue
+                offset = self.va_to_offset(fva, 1)
+                chunk = bytes(self.data[offset:offset + min(fsize, hi - fva)])
+                starts.update(insn.address for insn in md.disasm(chunk, fva))
+
+        if not starts:
+            size = min(section["vsize"], section["raw_size"]) or section["vsize"]
+            chunk = bytes(self.data[section["raw_offset"]:section["raw_offset"] + size])
+            starts = {insn.address for insn in md.disasm(chunk, lo)}
+
         cache[key] = starts
         return starts
 
@@ -614,6 +631,41 @@ def _op_add_section(state: _State, op: dict, where: str) -> None:
     image.commit_section(layout, state)
 
 
+_RIZIN_FUNC_CACHE: dict[str, list[tuple[int, int]]] = {}
+
+
+def _rizin_function_ranges(path: Path) -> list[tuple[int, int]]:
+    """用 rizin 分析函数区间 [(vaddr, size)]；失败返回空，让调用方退回盲扫。"""
+    key = str(path)
+    if key in _RIZIN_FUNC_CACHE:
+        return _RIZIN_FUNC_CACHE[key]
+    ranges: list[tuple[int, int]] = []
+    try:
+        from . import engines
+
+        rizin = engines.rizin_path()
+        if rizin:
+            # 小文件用 aaa（深分析，函数覆盖才够），大文件退回 aa 免得等太久
+            try:
+                big = Path(key).stat().st_size > 8 * 1024 * 1024
+            except OSError:
+                big = True
+            script = "aa; aflj" if big else "aaa; aflj"
+            proc = subprocess.run(
+                [rizin, "-q", "-e", "scr.color=0", "-c", script, key],
+                capture_output=True, text=True, timeout=300,
+            )
+            for row in json.loads(proc.stdout or "[]"):
+                offset = int(row.get("offset") or row.get("vaddr") or 0)
+                size = int(row.get("size") or 0)
+                if offset > 0 and size > 0:
+                    ranges.append((offset, size))
+    except Exception:
+        ranges = []
+    _RIZIN_FUNC_CACHE[key] = ranges
+    return ranges
+
+
 def _is_instruction_boundary(image: _Image, at_offset: int, at_va: int) -> bool:
     """at 是不是真实指令边界。
 
@@ -657,55 +709,84 @@ def _rel32(instr_va: int, target_va: int, what: str) -> bytes:
     return struct.pack("<i", delta)
 
 
-def _rel_branch(raw: bytearray) -> tuple[int, int] | None:
-    """识别 x86 相对分支指令，返回 (位移字段宽度, 字段偏移)。"""
+def _rel_branch(raw: bytearray):
+    """识别 x86 相对分支，返回 (宽度, 字段偏移, 类别)。"""
     if not raw:
         return None
     op = raw[0]
     if op in (0xE8, 0xE9):
-        return (4, 1)
-    if op == 0xEB or 0x70 <= op <= 0x7F or 0xE0 <= op <= 0xE3:
-        return (1, 1)
+        return (4, 1, "call" if op == 0xE8 else "jmp")
+    if op == 0xEB or 0x70 <= op <= 0x7F:
+        return (1, 1, "jmp" if op == 0xEB else "jcc")
+    if 0xE0 <= op <= 0xE3:
+        return (1, 1, "loop")
     if op == 0x0F and len(raw) >= 2 and 0x80 <= raw[1] <= 0x8F:
-        return (4, 2)
+        return (4, 2, "jcc")
     return None
 
 
-def _relocate(insns, dest_va: int, where: str, allow_unaligned: bool) -> bytes:
-    """按新地址重写要搬运的指令：相对分支重算位移，RIP 相对寻址直接拒绝。
+def _relocate(insns, dest_va: int, where: str, allow_unaligned: bool, final: bool = True) -> bytes:
+    """按新地址重写要搬运的指令。
 
-    今晚踩过的坑：把 `call rel32` 原样搬进洞，目标会指向洞里的错误位置，
-    而 `自检 通过` 只证明磁盘字节和内存镜像一致，证不了语义没变。
+    - call/jmp rel32：重算位移
+    - jcc/jmp rel8：放宽成 rel32（0F 8x / E9），否则搬远了必错
+    - loop/jrcxz rel8：没有宽编码，直接拒绝
+    - RIP 相对内存操作数：按新地址重算 disp32
+
+    final=False 时只算长度（位移写 0），给"先定洞地址再定稿"的两趟流程用。
     """
     out = bytearray()
     for insn in insns:
         raw = bytearray(insn.bytes)
         new_va = dest_va + len(out)
-        if any(operand.type == X86_OP_MEM and operand.mem.base == X86_REG_RIP
-               for operand in insn.operands):
-            if not allow_unaligned:
+
+        rip = next((o for o in insn.operands
+                    if o.type == X86_OP_MEM and o.mem.base == X86_REG_RIP), None)
+        if rip is not None:
+            target = insn.address + insn.size + rip.mem.disp
+            delta = (target - (new_va + insn.size)) if final else 0
+            if not -(1 << 31) <= delta < (1 << 31):
                 raise ReError(
-                    f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）用了 RIP 相对寻址，"
-                    "搬到代码洞后语义会变",
-                    hint="换一个 detour 点，避开这种指令；"
-                         "或者手工重写这条指令、把整段写成 op 的 code",
+                    f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）是 RIP 相对寻址，"
+                    f"搬到代码洞后位移 {delta} 超出 32 位",
+                    hint="把补丁节放得离代码更近，或换一个落点",
                 )
+            raw[-4:] = struct.pack("<i", delta)
             out += raw
             continue
+
         spec = _rel_branch(raw)
         if spec is None:
             out += raw
             continue
-        width, field_off = spec
+        width, field_off, kind = spec
+
+        if width == 1 and kind == "loop":
+            raise ReError(
+                f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）是 loop/jrcxz 短跳，"
+                "没有放宽编码，搬到代码洞后会跳错",
+                hint="换一个 detour 点，避开这条指令",
+            )
+
         old_rel = int.from_bytes(raw[field_off:field_off + width], "little", signed=True)
         target = insn.address + insn.size + old_rel
-        new_rel = target - (new_va + insn.size)
-        low, high = (-(1 << 7), 1 << 7) if width == 1 else (-(1 << 31), 1 << 31)
-        if not low <= new_rel < high:
+
+        if width == 1:                       # rel8 -> rel32
+            head = b"\xe9" if kind == "jmp" else bytes([0x0F, raw[0] + 0x10])
+            delta = (target - (new_va + len(head) + 4)) if final else 0
+            if not -(1 << 31) <= delta < (1 << 31):
+                raise ReError(
+                    f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）放宽成 rel32 后仍超范围",
+                    hint="把补丁节放得离代码更近",
+                )
+            out += head + struct.pack("<i", delta)
+            continue
+
+        new_rel = (target - (new_va + insn.size)) if final else 0
+        if not -(1 << 31) <= new_rel < (1 << 31):
             raise ReError(
-                f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）是相对跳转，"
-                f"搬到代码洞后位移 {new_rel} 超出 {width * 8} 位",
-                hint="把补丁节放得离代码更近，或换一个不含 call/jmp/jcc 的 detour 点",
+                f"{where} 要搬的 {insn.address:#x}（{insn.mnemonic}）重定位后位移 {new_rel} 超出 rel32",
+                hint="把补丁节放得离代码更近，或换一个落点",
             )
         raw[field_off:field_off + width] = new_rel.to_bytes(width, "little", signed=True)
         out += raw
@@ -748,12 +829,13 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
 
     cave_name = op.get("section") or DEFAULT_CAVE
     cave_name = str(cave_name)
-    stub_size = len(code) + n + JUMP_SIZE
+    moved_len = len(_relocate(insns, 0, where, allow_unaligned, final=False))
+    stub_size = len(code) + moved_len + JUMP_SIZE
     slot = image.reserve_cave(cave_name, stub_size, state, where)
     cave_va = slot["va"]
     back_va = at + n
-    back_instr = cave_va + len(code) + n
-    moved = _relocate(insns, cave_va + len(code), where, allow_unaligned)
+    moved = _relocate(insns, cave_va + len(code), where, allow_unaligned, final=True)
+    back_instr = cave_va + len(code) + len(moved)
     stub = code + moved + b"\xe9" + _rel32(back_instr, back_va, f"{where} 的回跳")
 
     if slot["offset"] < at_offset + n and at_offset < slot["offset"] + len(stub):
@@ -766,7 +848,7 @@ def _op_detour(state: _State, op: dict, where: str) -> None:
     image.put(slot["offset"], stub)
     state.changes.append(_change(
         "detour", "detour.cave", slot["offset"], before_stub, stub,
-        f"跳板：{len(code)} 字节补丁代码 + {n} 字节原始指令 + E9 回跳 {back_va:#x}",
+        f"跳板：{len(code)} 字节补丁代码 + {len(moved)} 字节原始指令 + E9 回跳 {back_va:#x}",
         va=cave_va, cave_va=cave_va, n=n,
     ))
 
@@ -1048,6 +1130,7 @@ def apply_plan(plan: dict, dry_run: bool = False) -> dict:
     if raw[:4] == b"\x7fELF":
         return _apply_elf(target, raw, ops, dry_run)
     image = _Image(raw)
+    image.source_path = target
     state = _State(image)
     for index, op in enumerate(ops):
         where = f"ops[{index}]"
