@@ -553,3 +553,49 @@ class ErrorTests(PatchTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DetourRelocationTests(unittest.TestCase):
+    """搬迁指令的重写：rel8 放宽、RIP 相对、以及 verified_boundary 逃生门。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make(self, name, code, site=0x10):
+        data = text_data(site=site, code=code)
+        return build_pe(sections=[{"name": ".text", "data": data, "characteristics": 0x60000020}]), site
+
+    def test_rel8_jump_is_widened_to_rel32(self):
+        pe, site = self.make("rel8.exe", bytes.fromhex("eb 02 90 90 90 90"))
+        path = self.dir / "rel8.exe"
+        path.write_bytes(pe)
+        text = section_of(path, ".text")
+        result = patch.patch_file(path, [
+            {"kind": "detour", "at": hex(text["va"] + site), "code": "", "section": ".text2"},
+        ])
+        self.assertTrue(result["ok"])
+        row = next(c for c in result["changes"] if c["label"] == "detour.cave")
+        cave_va, cave = row["va"], bytes.fromhex(row["after"])
+        # 原来的 eb 02 被放宽成 e9 rel32
+        self.assertEqual(cave[0], 0xE9)
+        target = text["va"] + site + 2 + 2          # 原 jmp 目标 = site+4
+        delta = struct.unpack_from("<i", cave, 1)[0]
+        self.assertEqual(cave_va + 5 + delta, target)
+
+    def test_mid_instruction_is_rejected_unless_verified(self):
+        pe, site = self.make("mid.exe", bytes.fromhex("48 83 ec 28 90 90"))
+        path = self.dir / "mid.exe"
+        path.write_bytes(pe)
+        text = section_of(path, ".text")
+        at = hex(text["va"] + site + 1)             # `48 83 ec 28` 的中间
+        with self.assertRaises(ReError):
+            patch.patch_file(path, [{"kind": "detour", "at": at, "code": "c3"}])
+
+        result = patch.patch_file(path, [
+            {"kind": "detour", "at": at, "code": "c3", "verified_boundary": True},
+        ])
+        self.assertTrue(result["ok"])
+        self.assertTrue(any("人工确认" in w for w in result["warnings"]))
