@@ -2,7 +2,9 @@
 
 import argparse
 import datetime as _dt
+import importlib
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -254,7 +256,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="装齐 java + rizin + ghidra")
     p.set_defaults(func=cmd_setup)
 
+    # 四簇（设备/插桩/抓包/证据）各自带 add_parser；模块没合入时给个明确的骨架，
+    # 让并行开发期也能 `re dev list` 这种调用拿到"尚未实现"而不是 argparse 的 invalid choice。
+    _add_optional(sub, "dev", "设备/模拟器生命周期")
+    _add_optional(sub, "dyn", "frida 插桩")
+    _add_optional(sub, "net", "抓包与 flow")
+    _add_optional(sub, "case", "证据目录与报告")
+
     return parser
+
+
+def _add_optional(subparsers, name, help_text):
+    """模块在就让它自己注册子命令；不在就注册一个报 code=3 的骨架。"""
+    try:
+        mod = importlib.import_module(f"pwre.{name}")
+    except ImportError:
+        mod = None
+    if mod is not None and hasattr(mod, "add_parser"):
+        mod.add_parser(subparsers)
+        return
+    p = subparsers.add_parser(name, help=help_text)
+    # 骨架也要吃下 `re dev list` 这种尾部参数（含 -x 形式）：否则 argparse 先报
+    # 用法错误（2），调用方看到的就不是"尚未实现"（3）。
+    p.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
+    def _stub(args, _name=name):
+        raise ReError(f"re {_name} 尚未实现", hint="该簇尚未合入当前分支", code=3)
+
+    p.set_defaults(func=_stub)
 
 
 def _byte(value: str) -> int:
@@ -305,6 +334,12 @@ def _entropy_note(value: float) -> str:
     return ""
 
 
+def _head_bytes(path: Path, count: int) -> bytes:
+    """只读文件头：大文件整读会把内存吃光，头读只要 count 字节。"""
+    with open(path, "rb") as fh:
+        return fh.read(count)
+
+
 def cmd_id(args):
     path = Path(args.path)
     info = sniff(path)
@@ -319,7 +354,11 @@ def cmd_id(args):
         "entry": info.entry,
         "sha256": info.sha256,
     }
-    head = entropy(path.read_bytes()[: 2 << 20])
+    head = entropy(_head_bytes(path, 2 << 20))
+    # 壳的判定也进 JSON：文本行里说了壳名，机器读的载荷里不能没有
+    packed = packed_reasons(info)
+    payload["packer"] = packer_name(info)
+    payload["packed_reasons"] = packed
     lines = [
         f"文件     {path}",
         f"大小     {human_size(info.size)}（{info.size} 字节）",
@@ -337,7 +376,7 @@ def cmd_id(args):
         sections = extra["sections"]
         names = [section["name"] for section in sections]
         lines.append(f"节       {len(names)} 个：{' '.join(names)}")
-        reasons = packed_reasons(info)
+        reasons = packed
         if reasons:
             name = packer_name(info)
             prefix = f"{name} 壳：" if name else "疑似加壳/保护："
@@ -372,13 +411,13 @@ def cmd_id(args):
         if count:
             lines.append(f"条目     {count} 个")
     elif info.kind == "unknown":
-        lines.append(f"magic    {path.read_bytes()[:8].hex(' ')}")
+        lines.append(f"magic    {_head_bytes(path, 8).hex(' ')}")
         lines.append(f"熵       {head:.2f}{_entropy_note(head)}")
 
     if info.kind in ("ihex", "srec"):
         lines.append("下一步   re hex 看段与地址，re fw 看向量表与入口")
     elif info.kind == "unknown":
-        blob = path.read_bytes()[: 4 << 20]
+        blob = _head_bytes(path, 4 << 20)
         samples = [text for _, _, text in scan.scan(blob, 6) if interesting(text)][:5]
         if samples:
             lines.append("线索     以下字符串值得先看：")
@@ -568,6 +607,13 @@ def cmd_proto(args):
     path = Path(args.path)
     if not path.is_file():
         raise ReError(f"不是文件：{path}")
+    info = sniff(path)
+    if info.kind != "unknown":
+        raise ReError(
+            f"{path.name} 是{info.label}，不是裸帧数据",
+            hint="proto 只吃裸帧（不认格式的二进制）；认格式用 re id，容器/安装包用 re unpack",
+            code=2,
+        )
     data = path.read_bytes()
     if not args.frame or args.frame < 1:
         raise ReError("要给正的 --frame（帧长）", hint="先 re hex / re id 看清楚结构；按帧切开才能看字段")
@@ -901,6 +947,38 @@ def cmd_fw(args):
 # ------------------------------------------------------------- doctor
 
 
+def _entry_checks() -> tuple[list[str], dict]:
+    """入口三项：re.cmd 的 CRLF、console script、PATH。任一项缺，`re` 就不是随手能跑的命令。"""
+    root = Path(__file__).resolve().parents[2]
+    lines, payload = [], {}
+
+    script = root / "re.cmd"
+    raw = script.read_bytes() if script.is_file() else b""
+    cr, lf = raw.count(b"\r"), raw.count(b"\n")
+    # cmd.exe 逐行解析；只剩 LF 时整行被当成一条命令（`'t' 不是内部命令`）
+    crlf = bool(raw) and cr > 0 and cr >= lf - 1
+    lines.append(f"  {'OK  ' if crlf else '缺  '} re.cmd   CRLF={crlf}（{cr} CR / {lf} LF）")
+    if not crlf:
+        lines.append("       修法：按 CRLF 重写 re.cmd（.gitattributes 已声明 *.cmd eol=crlf），或重新检出")
+    payload["re_cmd"] = {"path": str(script), "exists": script.is_file(), "crlf": crlf,
+                         "cr": cr, "lf": lf}
+
+    exe = root / ".venv" / "Scripts" / "re.exe"
+    has_exe = exe.is_file()
+    where = str(exe) if has_exe else "不在 .venv\\Scripts 里"
+    lines.append(f"  {'OK  ' if has_exe else '缺  '} re.exe   {where}")
+    if not has_exe:
+        lines.append("       修法：在仓库根 python -m venv .venv 后 .venv\\Scripts\\pip install -e .")
+    payload["re_exe"] = {"path": str(exe), "exists": has_exe}
+
+    on_path = shutil.which("re")
+    lines.append(f"  {'OK  ' if on_path else '缺  '} PATH     {on_path or 're 不在 PATH'}")
+    if not on_path:
+        lines.append("       修法：把仓库根加进 PATH，或直接用 re.cmd 的完整路径")
+    payload["path"] = {"which": on_path, "on_path": bool(on_path)}
+    return lines, payload
+
+
 def cmd_doctor(args):
     lines = [f"re {__version__}  python {sys.version.split()[0]}  {sys.executable}"]
     lines.append("引擎")
@@ -917,6 +995,10 @@ def cmd_doctor(args):
         mark = "OK  " if row["path"] else "缺失"
         lines.append(f"  {mark} {row['name']:<8} {row['path'] or row['purpose']}")
         payload.setdefault("tools", []).append(row)
+    lines.append("入口")
+    entry_lines, entry_payload = _entry_checks()
+    lines.extend(entry_lines)
+    payload["entry"] = entry_payload
     lines.append(f"数据目录 {engines.data_dir()}")
     if missing:
         lines.append("")

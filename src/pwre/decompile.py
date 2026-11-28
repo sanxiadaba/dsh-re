@@ -18,6 +18,19 @@ SCRIPT_DIR = Path(__file__).parent / "ghidra_scripts"
 DEFAULT_TIMEOUT = 300
 
 
+def _require_jdk(java: str) -> None:
+    """Ghidra 对自己的 JDK 有硬要求（当前 25）；本机 java 是 8 时它根本起不来。
+    版本读不出来（0）就不判死——那是探测失败，不是版本不够。"""
+    need = engines.ghidra_java_min()
+    have = engines.java_version(java)
+    if have and have < need:
+        raise ReError(
+            f"Ghidra 要 JDK {need} 及以上，当前是 {have}（{java}）",
+            hint="用 re setup --ghidra 装配套 JDK（引擎目录里已有），或把它的 bin 放到 PATH 前面",
+            code=3,
+        )
+
+
 def _processor_for(image) -> str:
     from . import armvec
 
@@ -90,6 +103,7 @@ def decompile_all(path: Path, out_file: Path, base: int | None = None,
     """一次性把目标里所有函数反编译到 out_file（导入+分析只做一遍）。"""
     exe = engines.require("ghidra")
     java = engines.require("java")
+    _require_jdk(java)
     env = dict(os.environ)
     env["JAVA_HOME"] = str(Path(java).parent.parent)
     project_root = Path(tempfile.mkdtemp(prefix="re-proj-", dir=str(engines.data_dir())))
@@ -132,6 +146,7 @@ def decompile(path: Path, at: int | None, sym: str | None, base: int | None,
               timeout: int = DEFAULT_TIMEOUT) -> dict:
     exe = engines.require("ghidra")
     java = engines.require("java")
+    _require_jdk(java)
     env = dict(os.environ)
     env["JAVA_HOME"] = str(Path(java).parent.parent)
 

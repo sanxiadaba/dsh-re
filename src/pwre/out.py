@@ -3,10 +3,17 @@
 import json
 import sys
 
+SCHEMA = 1
+
 
 def emit(args, lines, payload=None):
-    """按 --json 决定输出形态。payload 为 None 时不输出 JSON。"""
+    """按 --json 决定输出形态。payload 为 None 时不输出 JSON。
+
+    dict 载荷统一带 schema 版本，下游可以按版本解析；不改调用方传进来的 dict。
+    """
     if getattr(args, "json", False) and payload is not None:
+        if isinstance(payload, dict):
+            payload = {"schema": SCHEMA, **payload}
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return
     for line in lines:

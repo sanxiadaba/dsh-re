@@ -21,11 +21,19 @@ def _decode(path) -> str:
 
 def load(path, base: int | None = None) -> Image:
     path = Path(path)
-    kind = sniff(path).kind
+    info = sniff(path)
+    kind = info.kind
     if kind == "ihex":
         return hexfile.parse_ihex(_decode(path))
     if kind == "srec":
         return hexfile.parse_srec(_decode(path))
+    # 认出是别的格式就别当裸固件切：文本/PE/压缩包给 --base 也变不成固件
+    if kind != "unknown":
+        raise ReError(
+            f"{path.name} 是{info.label}，不是固件",
+            hint="固件是 .hex/.srec，或裸 .bin 配 --base；看结构用 re id / re pe / re unpack",
+            code=2,
+        )
     if base is None:
         raise ReError(
             f"{path.name} 不是 HEX/S-record，裸二进制必须给加载地址",
