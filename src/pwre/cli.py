@@ -266,10 +266,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# 子命令名 ≠ 模块名：R-01 是 device.py、R-03 是 netcap.py。
+# 不映射的话 `re dev`/`re net` 永远找不到模块，合入后也只会落到 stub。
+_OPTIONAL_MODULES = {"dev": "device", "dyn": "dyn", "net": "netcap", "case": "case"}
+
+
 def _add_optional(subparsers, name, help_text):
     """模块在就让它自己注册子命令；不在就注册一个报 code=3 的骨架。"""
+    module = _OPTIONAL_MODULES.get(name, name)
     try:
-        mod = importlib.import_module(f"pwre.{name}")
+        mod = importlib.import_module(f"pwre.{module}")
     except ImportError:
         mod = None
     if mod is not None and hasattr(mod, "add_parser"):

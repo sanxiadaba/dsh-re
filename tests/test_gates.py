@@ -4,12 +4,15 @@
 字节的许可证摊成 0x08000000 的固件；`re proto LICENSE` 照切 66 帧。违反「不猜」。
 """
 
+import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import random
 import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -38,6 +41,16 @@ def run(*argv):
 def bare_blob() -> bytes:
     """确定性伪随机 64 字节：没有 magic，也不是文本，只能认成 unknown。"""
     return bytes(random.Random(20261128).randrange(256) for _ in range(64))
+
+
+def optional_module(name: str) -> str:
+    """子命令名对应的模块名（dev→device、net→netcap）；没映射时同名。"""
+    return cli._OPTIONAL_MODULES.get(name, name)
+
+
+def module_present(name: str) -> bool:
+    """簇模块是否已经合入当前分支。合入后骨架断言就不适用了。"""
+    return importlib.util.find_spec(f"pwre.{optional_module(name)}") is not None
 
 
 class FormatGateTests(unittest.TestCase):
@@ -141,15 +154,49 @@ class JsonContractTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue().strip(), "一行文本")
 
 
+class OptionalModuleMapTests(unittest.TestCase):
+    def test_subcommand_names_map_to_real_module_names(self):
+        # R-01 的模块叫 device、R-03 的叫 netcap；映射错了合入后也永远只有骨架
+        self.assertEqual(cli._OPTIONAL_MODULES["dev"], "device")
+        self.assertEqual(cli._OPTIONAL_MODULES["net"], "netcap")
+        self.assertEqual(cli._OPTIONAL_MODULES["dyn"], "dyn")
+        self.assertEqual(cli._OPTIONAL_MODULES["case"], "case")
+        self.assertEqual(optional_module("dev"), "device")
+        self.assertEqual(optional_module("net"), "netcap")
+
+    def test_add_optional_imports_the_mapped_module(self):
+        imported = []
+        fake = types.SimpleNamespace(add_parser=lambda subparsers: None)
+
+        def fake_import(dotted):
+            imported.append(dotted)
+            return fake
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="cmd")
+        with mock.patch.object(cli.importlib, "import_module", fake_import):
+            cli._add_optional(sub, "dev", "设备/模拟器生命周期")
+            cli._add_optional(sub, "net", "抓包与 flow")
+        self.assertEqual(imported, ["pwre.device", "pwre.netcap"])
+        # 有 add_parser 的模块自己注册，不该再挂骨架
+        self.assertNotIn("dev", sub.choices)
+        self.assertNotIn("net", sub.choices)
+
+
 class StubRegistrationTests(unittest.TestCase):
     def test_unmerged_cluster_is_exit_3_not_usage_error(self):
-        for name in ("dev", "dyn", "net", "case"):
+        pending = [name for name in ("dev", "dyn", "net", "case") if not module_present(name)]
+        if not pending:
+            self.skipTest("四簇模块都已合入，骨架不再生效")
+        for name in pending:
             with self.subTest(name=name):
                 code, _out, err = run(name, "list")
                 self.assertEqual(code, 3, err)
                 self.assertIn("尚未实现", err)
 
     def test_stub_accepts_trailing_arguments(self):
+        if module_present("dev"):
+            self.skipTest("pwre.device 已合入，dev 不再是骨架")
         # argparse 先报 invalid choice 的话，调用方看到的是 2，不是"尚未实现"
         code, _out, err = run("dev", "start", "pixel", "--headless")
         self.assertEqual(code, 3, err)
